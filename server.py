@@ -2,13 +2,15 @@ from __future__ import annotations
 
 import os
 import sqlite3
+import json
 import logging
+import time
 from pathlib import Path
 from typing import Any, Dict, Tuple
 
 import numpy as np
 import pandas as pd
-from flask import Flask, jsonify, request, send_from_directory
+from flask import Flask, jsonify, request, send_from_directory, g
 from flask_cors import CORS
 
 from src.analyzer.backtest_runner import load_strategy
@@ -23,15 +25,48 @@ logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(me
 
 DB_PATH = Path("data/market_data.db")
 FRONTEND_DIST = Path("frontend/dist")
+UNIVERSE_CACHE_TTL_SEC = int(os.getenv("UNIVERSE_CACHE_TTL_SEC", "300"))
+SECTORS_CACHE_TTL_SEC = int(os.getenv("SECTORS_CACHE_TTL_SEC", "300"))
+SELECTION_CACHE_TTL_SEC = int(os.getenv("SELECTION_CACHE_TTL_SEC", "30"))
+_universe_cache: Dict[str, Any] = {"ts": 0.0, "rows": None}
+_sectors_cache: Dict[str, Any] = {"ts": 0.0, "rows": None}
+_selection_cache: Dict[str, Any] = {"ts": 0.0, "data": None}
+
 
 _store = SQLiteStore(str(DB_PATH))
 _store.conn.close()
 
 
 def get_conn() -> sqlite3.Connection:
-    conn = sqlite3.connect(DB_PATH)
+    conn = sqlite3.connect(str(DB_PATH), timeout=5, check_same_thread=False)
     conn.row_factory = sqlite3.Row
+    try:
+        conn.execute("PRAGMA journal_mode=WAL;")
+        conn.execute("PRAGMA synchronous=NORMAL;")
+        conn.execute("PRAGMA busy_timeout=5000;")
+    except Exception:
+        pass
     return conn
+
+
+def get_db() -> sqlite3.Connection:
+    db = getattr(g, "_db", None)
+    if db is None:
+        db = get_conn()
+        setattr(g, "_db", db)
+    return db
+
+
+def _close_db(exc: Exception | None = None) -> None:
+    db = getattr(g, "_db", None)
+    if db is not None:
+        try:
+            db.close()
+        finally:
+            try:
+                delattr(g, "_db")
+            except Exception:
+                pass
 
 
 def _count(conn: sqlite3.Connection, table_expr: str) -> int:
@@ -75,6 +110,8 @@ def _missing_codes(conn: sqlite3.Connection, table: str) -> int:
 app = Flask(__name__, static_folder=str(FRONTEND_DIST), static_url_path="")
 CORS(app, resources={r"/*": {"origins": "*"}})
 
+app.teardown_appcontext(_close_db)
+
 @app.route("/")
 def serve_index():
     return send_from_directory(app.static_folder, "index.html")
@@ -90,60 +127,74 @@ def serve_static(path: str):
 @app.get("/universe")
 def universe():
     """Universe list (NASDAQ100 + S&P500)."""
-    conn = get_conn()
+    conn = get_db()
     sector = request.args.get("sector")
-    if sector:
-        if sector.upper() == "UNKNOWN":
-            where = "s.sector_name IS NULL"
-            params: Tuple[Any, ...] = ()
-        else:
-            where = "s.sector_name = ?"
-            params = (sector,)
-    else:
-        where = "1=1"
-        params = ()
+    now_ts = time.time()
 
-    try:
-        df = pd.read_sql_query(
-            f"""
-            SELECT u.code, u.name, u.market, u.group_name as 'group',
-                   COALESCE(s.sector_name, 'UNKNOWN') AS sector_name,
-                   s.industry_name
-            FROM universe_members u
-            LEFT JOIN sector_map s ON u.code = s.code
-            WHERE {where}
-            ORDER BY u.code
-            """,
-            conn,
-            params=params,
-        )
-    except Exception:
-        df = pd.read_sql_query(
-            "SELECT code, name, market, group_name as 'group' FROM universe_members ORDER BY code",
-            conn,
-        )
-    return jsonify(df.to_dict(orient="records"))
+    cached = _universe_cache.get("rows")
+    if cached is not None and now_ts - float(_universe_cache.get("ts") or 0.0) < UNIVERSE_CACHE_TTL_SEC:
+        rows = cached
+    else:
+        try:
+            df = pd.read_sql_query(
+                """
+                SELECT u.code, u.name, u.market, u.group_name as 'group',
+                       COALESCE(s.sector_name, 'UNKNOWN') AS sector_name,
+                       s.industry_name
+                FROM universe_members u
+                LEFT JOIN sector_map s ON u.code = s.code
+                ORDER BY u.code
+                """,
+                conn,
+            )
+        except Exception:
+            df = pd.read_sql_query(
+                "SELECT code, name, market, group_name as 'group' FROM universe_members ORDER BY code",
+                conn,
+            )
+        df = df.replace([np.inf, -np.inf], np.nan)
+        df = df.astype(object).where(pd.notnull(df), None)
+        rows = df.to_dict(orient="records")
+        _universe_cache.update({"ts": now_ts, "rows": rows})
+
+    if sector and sector != "ALL":
+        if str(sector).upper() == "UNKNOWN":
+            rows = [r for r in rows if str(r.get("sector_name") or "UNKNOWN").upper() == "UNKNOWN"]
+        else:
+            rows = [r for r in rows if str(r.get("sector_name") or "UNKNOWN") == str(sector)]
+    return jsonify(rows)
+
 
 
 @app.get("/sectors")
 def sectors():
-    conn = get_conn()
-    try:
-        df = pd.read_sql_query(
-            """
-            SELECT u.market,
-                   COALESCE(s.sector_name, 'UNKNOWN') AS sector_name,
-                   COUNT(*) AS count
-            FROM universe_members u
-            LEFT JOIN sector_map s ON u.code = s.code
-            GROUP BY u.market, COALESCE(s.sector_name, 'UNKNOWN')
-            ORDER BY u.market, count DESC, sector_name
-            """,
-            conn,
-        )
-    except Exception:
-        df = pd.DataFrame([], columns=["market", "sector_name", "count"])
-    return jsonify(df.to_dict(orient="records"))
+    conn = get_db()
+    now_ts = time.time()
+    cached = _sectors_cache.get("rows")
+    if cached is not None and now_ts - float(_sectors_cache.get("ts") or 0.0) < SECTORS_CACHE_TTL_SEC:
+        rows = cached
+    else:
+        try:
+            df = pd.read_sql_query(
+                """
+                SELECT u.market,
+                       COALESCE(s.sector_name, 'UNKNOWN') AS sector_name,
+                       COUNT(*) AS count
+                FROM universe_members u
+                LEFT JOIN sector_map s ON u.code = s.code
+                GROUP BY u.market, COALESCE(s.sector_name, 'UNKNOWN')
+                ORDER BY u.market, count DESC, sector_name
+                """,
+                conn,
+            )
+        except Exception:
+            df = pd.DataFrame([], columns=["market", "sector_name", "count"])
+        df = df.replace([np.inf, -np.inf], np.nan)
+        df = df.astype(object).where(pd.notnull(df), None)
+        rows = df.to_dict(orient="records")
+        _sectors_cache.update({"ts": now_ts, "rows": rows})
+    return jsonify(rows)
+
 
 
 @app.get("/prices")
@@ -153,7 +204,7 @@ def prices():
     if not code:
         return jsonify([])
 
-    conn = get_conn()
+    conn = get_db()
     df = pd.read_sql_query(
         """
         SELECT date, open, high, low, close, volume, amount, ma25, disparity
@@ -185,32 +236,32 @@ def _build_selection_summary(conn: sqlite3.Connection, settings: Dict[str, Any])
     entry_mode = str(getattr(params, "entry_mode", "mean_reversion") or "mean_reversion").lower()
     trend_filter = bool(getattr(params, "trend_ma25_rising", False))
 
-    universe_df = pd.read_sql_query("SELECT code, name, market, group_name FROM universe_members", conn)
-    codes = universe_df["code"].dropna().astype(str).tolist()
-    if not codes:
-        return {"date": None, "candidates": [], "summary": {"total": 0, "final": 0}}
-    group_map = dict(zip(universe_df["code"], universe_df["group_name"]))
+    universe_total = int(conn.execute("SELECT COUNT(*) FROM universe_members").fetchone()[0] or 0)
+    group_map = {row[0]: row[1] for row in conn.execute("SELECT code, group_name FROM universe_members").fetchall()}
 
-    placeholder = ",".join("?" * len(codes))
-    sql = f"""
-        SELECT code, date, close, amount, ma25, disparity
-        FROM (
-            SELECT code, date, close, amount, ma25, disparity,
-                   ROW_NUMBER() OVER (PARTITION BY code ORDER BY date DESC) AS rn
-            FROM daily_price
-            WHERE code IN ({placeholder})
+    sql = """
+        WITH recent AS (
+            SELECT d.code, d.date, d.close, d.amount, d.ma25, d.disparity,
+                   u.name, u.market, u.group_name,
+                   ROW_NUMBER() OVER (PARTITION BY d.code ORDER BY d.date DESC) AS rn_desc
+            FROM daily_price d
+            JOIN universe_members u ON u.code = d.code
+        ),
+        calc AS (
+            SELECT code, date, close, amount, ma25, disparity, name, market, group_name,
+                   LAG(ma25,1) OVER (PARTITION BY code ORDER BY date) AS ma25_prev,
+                   (close / LAG(close,3) OVER (PARTITION BY code ORDER BY date) - 1.0) AS ret3,
+                   rn_desc
+            FROM recent
+            WHERE rn_desc <= 4
         )
-        WHERE rn <= 4
+        SELECT code, date, close, amount, ma25, disparity, ma25_prev, ret3, name, market, group_name
+        FROM calc
+        WHERE rn_desc = 1
     """
-    df = pd.read_sql_query(sql, conn, params=codes)
-    if df.empty:
-        return {"date": None, "candidates": [], "summary": {"total": len(codes), "final": 0}}
-
-    df = df.sort_values(["code", "date"])
-    df["ma25_prev"] = df.groupby("code")["ma25"].shift(1)
-    df["ret3"] = df.groupby("code")["close"].pct_change(3)
-    latest = df.groupby("code").tail(1).copy()
-    latest = latest.merge(universe_df, on="code", how="left")
+    latest = pd.read_sql_query(sql, conn)
+    if latest.empty:
+        return {"date": None, "candidates": [], "summary": {"total": universe_total, "final": 0}}
 
     total = len(latest)
 
@@ -312,14 +363,28 @@ def _build_selection_summary(conn: sqlite3.Connection, settings: Dict[str, Any])
 
 @app.get("/selection")
 def selection():
-    conn = get_conn()
+    now_ts = time.time()
+    cached = _selection_cache.get("data")
+    if cached is not None and now_ts - float(_selection_cache.get("ts") or 0.0) < SELECTION_CACHE_TTL_SEC:
+        return jsonify(cached)
+
+    conn = get_db()
     settings = load_settings()
-    return jsonify(_build_selection_summary(conn, settings))
+    data = _build_selection_summary(conn, settings)
+    try:
+        data = json.loads(json.dumps(data, allow_nan=False))
+    except Exception:
+        pass
+    _selection_cache.update({"ts": now_ts, "data": data})
+    return jsonify(data)
+
+
+
 
 
 @app.get("/status")
 def status():
-    conn = get_conn()
+    conn = get_db()
     out = {
         "universe": {"total": _count(conn, "universe_members")},
         "daily_price": {
@@ -335,7 +400,7 @@ def status():
 
 @app.get("/jobs")
 def jobs():
-    conn = get_conn()
+    conn = get_db()
     limit = int(request.args.get("limit", 20))
     df = pd.read_sql_query("SELECT * FROM job_runs ORDER BY started_at DESC LIMIT ?", conn, params=(limit,))
     return jsonify(df.to_dict(orient="records"))

@@ -1,4 +1,4 @@
-import { useEffect, useMemo, useState } from 'react';
+import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import {
   fetchUniverse,
   fetchSectors,
@@ -62,6 +62,8 @@ function App() {
   const [days, setDays] = useState(240);
   const [modalOpen, setModalOpen] = useState(false);
 
+  const inFlightRef = useRef(false);
+
   const marketFilter = useMemo(() => {
     if (groupFilter === 'ALL') return 'ALL';
     return groupFilter === 'NASDAQ100' ? 'NASDAQ' : 'SP500';
@@ -73,28 +75,39 @@ function App() {
     return list.filter((s) => String(s.market || '').toUpperCase().includes(marketFilter));
   }, [sectors, marketFilter]);
 
-  const reload = async () => {
-    try {
-      const [u, s, sel, st] = await Promise.all([
-        fetchUniverse(sectorFilter !== 'ALL' ? sectorFilter : undefined),
-        fetchSectors(),
-        fetchSelection(),
-        fetchStatus(),
-      ]);
-      setUniverse(asArray(u));
-      setSectors(asArray(s));
-      setSelection(sel && typeof sel === 'object' ? sel : { date: null, candidates: [], summary: {} });
-      setStatus(st && typeof st === 'object' ? st : null);
-    } catch {
-      // ignore
-    }
-  };
+  const loadStatic = useCallback(() => {
+    fetchUniverse()
+      .then((u) => setUniverse(asArray(u)))
+      .catch(() => setUniverse([]))
+    fetchSectors()
+      .then((s) => setSectors(asArray(s)))
+      .catch(() => setSectors([]))
+  }, [])
+
+  const loadDynamic = useCallback(() => {
+    if (inFlightRef.current) return
+    inFlightRef.current = true
+    Promise.all([fetchSelection().catch(() => null), fetchStatus().catch(() => null)])
+      .then(([sel, st]) => {
+        setSelection(sel && typeof sel === 'object' ? sel : { date: null, candidates: [], summary: {} })
+        setStatus(st && typeof st === 'object' ? st : null)
+      })
+      .finally(() => {
+        inFlightRef.current = false
+      })
+  }, [])
+
+  const refreshAll = useCallback(() => {
+    loadStatic()
+    loadDynamic()
+  }, [loadStatic, loadDynamic]);
+
 
   useEffect(() => {
-    reload();
-    const id = setInterval(() => reload(), 30000);
+    refreshAll();
+    const id = setInterval(() => loadDynamic(), 45000);
     return () => clearInterval(id);
-  }, [sectorFilter]);
+  }, [refreshAll, loadDynamic]);
 
   useEffect(() => {
     if (!selected) return;

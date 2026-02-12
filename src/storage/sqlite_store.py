@@ -227,8 +227,13 @@ class SQLiteStore:
     def __init__(self, db_path: str = "data/market_data.db"):
         os.makedirs(os.path.dirname(db_path), exist_ok=True)
         self.db_path = db_path
-        self.conn = sqlite3.connect(self.db_path, check_same_thread=False)
+        self.conn = sqlite3.connect(self.db_path, timeout=5, check_same_thread=False)
         self.conn.execute("PRAGMA journal_mode=WAL;")
+        try:
+            self.conn.execute("PRAGMA synchronous=NORMAL;")
+            self.conn.execute("PRAGMA busy_timeout=5000;")
+        except Exception:
+            pass
         self.conn.row_factory = sqlite3.Row
         self._refill_cols: Optional[set[str]] = None
         self.ensure_schema()
