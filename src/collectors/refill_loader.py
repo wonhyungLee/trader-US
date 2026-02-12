@@ -435,7 +435,13 @@ def main():
                 done_count = store.conn.execute("SELECT count(*) FROM refill_progress WHERE status='DONE'").fetchone()[0]
                 
                 # Notify after CSV export
-                msg = f"✅ [refill] {code} 완료 및 CSV 저장됨 ({done_count}/{total_universe_count})"
+                total = max(total_universe_count, 1)
+                pct = (done_count / total) * 100.0
+                remaining = max(total - done_count, 0)
+                msg = (
+                    f"✅ [refill] {code} 완료 및 CSV 저장됨 "
+                    f"({done_count}/{total_universe_count}, {pct:.1f}%, remaining {remaining})"
+                )
                 maybe_notify(settings, msg)
                 
                 # Prevent Discord rate limit
@@ -454,7 +460,15 @@ def main():
         store.finish_job(job_id, "ERROR", str(e))
     finally:
         maybe_export_db(settings, store.db_path)
-        maybe_notify(settings, f"🏁 [refill] 전체 작업 종료 (총 {processed_in_this_run}개)")
+        try:
+            done_total = store.conn.execute("SELECT count(*) FROM refill_progress WHERE status='DONE'").fetchone()[0]
+        except Exception:
+            done_total = None
+        if done_total is not None:
+            msg = f"🏁 [refill] 전체 작업 종료 (이번 실행 {processed_in_this_run}개, 누적 {done_total}/{total_universe_count})"
+        else:
+            msg = f"🏁 [refill] 전체 작업 종료 (이번 실행 {processed_in_this_run}개)"
+        maybe_notify(settings, msg)
 
 if __name__ == "__main__":
     main()

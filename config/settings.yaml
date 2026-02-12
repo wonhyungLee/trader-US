@@ -34,6 +34,11 @@ export_csv:
   mode: "overwrite"
   tables: []
 
+# Discord 알림 (환경변수 DISCORD_WEBHOOK_URL 필요)
+discord:
+  enabled: true
+  webhook: "${DISCORD_WEBHOOK_URL}"
+
 # 전략 파라미터 (Selection 화면에 반영)
 # - 코드는 기존 프로젝트 키명을 유지합니다.
 #   (NASDQ100=kospi, S&P500=kosdaq 로 매핑)
