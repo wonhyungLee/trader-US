@@ -5,18 +5,19 @@ if [ -z "$ROOT" ]; then
   ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 fi
 cd "$ROOT"
+mkdir -p logs
 
-PYBIN="./myenv/bin/python"
+PYBIN="$ROOT/.venv/bin/python"
 if [ ! -x "$PYBIN" ]; then
   PYBIN="python3"
 fi
 
-# wait for other data loaders to finish
-while pgrep -f accuracy_data_loader >/dev/null || pgrep -f universe_loader >/dev/null; do
-  sleep 60
+# wait for universe_loader if running
+while pgrep -f universe_loader >/dev/null; do
+  sleep 30
 done
 
-$PYBIN -m src.collectors.sector_classifier --refresh-days 30 --sleep 0.5 > logs/sector_classifier.log 2>&1
+$PYBIN -m src.collectors.sector_seed_loader --seed data/sector_map_seed.csv > logs/sector_seed_loader.log 2>&1
 
 $PYBIN - <<'PY' > logs/sector_verify.log 2>&1
 import pandas as pd
@@ -47,11 +48,11 @@ for p in files:
         continue
     if 'code' not in df.columns:
         continue
-    for c in df['code'].astype(str).str.zfill(6).tolist():
+    for c in df['code'].astype(str).tolist():
         code_set.add(c)
 
 print(f'sector CSV total unique codes={len(code_set)}')
-missing = set(uni['code'].astype(str).str.zfill(6).tolist()) - code_set
+missing = set(uni['code'].astype(str).tolist()) - code_set
 print(f'sector CSV missing={len(missing)}')
 if missing:
     miss_path = root / 'MISSING.csv'

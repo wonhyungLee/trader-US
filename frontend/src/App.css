@@ -12,6 +12,11 @@ body{margin:0;background:#0b0e14;color:#e8ecf3;}
 .hint{font-size:12px;opacity:0.75;margin-bottom:8px;}
 .controls{display:flex;flex-wrap:wrap;gap:12px;}
 .controls label{display:flex;flex-direction:column;gap:6px;font-size:12px;opacity:0.9;}
+.controlGroup{display:flex;flex-direction:column;gap:6px;font-size:12px;opacity:0.9;}
+.segmented{display:flex;gap:8px;flex-wrap:wrap;}
+.segmented button{background:rgba(255,255,255,0.06);border:1px solid rgba(255,255,255,0.12);color:#e8ecf3;border-radius:999px;padding:8px 14px;font-size:12px;cursor:pointer;transition:background .15s,border-color .15s;}
+.segmented button:hover{background:rgba(255,255,255,0.12);}
+.segmented button.active{background:#1a2538;border-color:#2c3f62;}
 select,input{background:rgba(255,255,255,0.06);border:1px solid rgba(255,255,255,0.12);border-radius:10px;color:#e8ecf3;padding:8px 10px;outline:none;}
 input::placeholder{color:rgba(232,236,243,0.6);}
 .tableWrap{max-height:360px;overflow:auto;border-radius:10px;border:1px solid rgba(255,255,255,0.08);}

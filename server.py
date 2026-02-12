@@ -189,6 +189,7 @@ def _build_selection_summary(conn: sqlite3.Connection, settings: Dict[str, Any])
     codes = universe_df["code"].dropna().astype(str).tolist()
     if not codes:
         return {"date": None, "candidates": [], "summary": {"total": 0, "final": 0}}
+    group_map = dict(zip(universe_df["code"], universe_df["group_name"]))
 
     placeholder = ",".join("?" * len(codes))
     sql = f"""
@@ -222,7 +223,7 @@ def _build_selection_summary(conn: sqlite3.Connection, settings: Dict[str, Any])
         stage = stage.head(liquidity_rank)
 
     def pass_signal(row) -> bool:
-        group = str(row.get("group_name") or "").upper()
+        group = str(row.get("group_name") or row.get("market") or "").upper()
         threshold = buy_nasdaq if "NASDAQ" in group else buy_sp500
         try:
             disp = float(row.get("disparity") or 0)
@@ -258,6 +259,13 @@ def _build_selection_summary(conn: sqlite3.Connection, settings: Dict[str, Any])
 
     final_rows = []
     sector_counts: Dict[str, int] = {}
+    try:
+        held = conn.execute("SELECT code FROM position_state").fetchall()
+        for (code,) in held:
+            sec = group_map.get(code) or "UNKNOWN"
+            sector_counts[sec] = sector_counts.get(sec, 0) + 1
+    except Exception:
+        sector_counts = {}
     for _, row in ranked.iterrows():
         sec = row.get("sector_name") or row.get("group_name") or "UNKNOWN"
         if max_per_sector and sector_counts.get(sec, 0) >= max_per_sector:
@@ -278,7 +286,7 @@ def _build_selection_summary(conn: sqlite3.Connection, settings: Dict[str, Any])
         pass
 
     latest_date = latest["date"].max()
-    cols = ["code", "name", "market", "amount", "close", "disparity", "rank", "sector_name", "industry_name"]
+    cols = ["code", "name", "market", "group_name", "amount", "close", "disparity", "rank", "sector_name", "industry_name"]
     for c in cols:
         if c not in final.columns:
             final[c] = None

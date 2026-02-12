@@ -113,7 +113,11 @@ function App() {
   const universeFiltered = useMemo(() => {
     const keyword = search.trim().toLowerCase();
     return asArray(universe)
-      .filter((row) => (groupFilter === 'ALL' ? true : row.group === groupFilter))
+      .filter((row) => (
+        groupFilter === 'ALL'
+          ? true
+          : String(row.group || '').toUpperCase().includes(groupFilter)
+      ))
       .filter((row) => (sectorFilter === 'ALL' ? true : String(row.sector_name || 'UNKNOWN') === sectorFilter))
       .filter((row) => {
         if (!keyword) return true;
@@ -123,7 +127,17 @@ function App() {
       });
   }, [universe, groupFilter, sectorFilter, search]);
 
-  const candidates = useMemo(() => asArray(selection?.candidates), [selection]);
+  const candidates = useMemo(() => {
+    const list = asArray(selection?.candidates);
+    if (groupFilter === 'ALL') return list;
+    return list.filter((row) => {
+      const g = String(row.group || row.group_name || '').toUpperCase();
+      if (g) return g.includes(groupFilter);
+      const m = String(row.market || '').toUpperCase();
+      if (groupFilter === 'NASDAQ100') return m.includes('NASDAQ');
+      return m.includes('SP500') || m.includes('S&P');
+    });
+  }, [selection, groupFilter]);
   const chartData = useMemo(() => [...asArray(prices)].reverse(), [prices]);
   const latest = chartData.length ? chartData[chartData.length - 1] : null;
   const prev = chartData.length > 1 ? chartData[chartData.length - 2] : null;
@@ -149,14 +163,32 @@ function App() {
         <section className="panel">
           <div className="panelTitle">필터</div>
           <div className="controls">
-            <label>
-              그룹
-              <select value={groupFilter} onChange={(e) => setGroupFilter(e.target.value)}>
-                <option value="NASDAQ100">NASDAQ100</option>
-                <option value="SP500">S&P500</option>
-                <option value="ALL">전체</option>
-              </select>
-            </label>
+            <div className="controlGroup">
+              <span>그룹</span>
+              <div className="segmented">
+                <button
+                  type="button"
+                  className={groupFilter === 'NASDAQ100' ? 'active' : ''}
+                  onClick={() => setGroupFilter('NASDAQ100')}
+                >
+                  NASDAQ100
+                </button>
+                <button
+                  type="button"
+                  className={groupFilter === 'SP500' ? 'active' : ''}
+                  onClick={() => setGroupFilter('SP500')}
+                >
+                  S&P500
+                </button>
+                <button
+                  type="button"
+                  className={groupFilter === 'ALL' ? 'active' : ''}
+                  onClick={() => setGroupFilter('ALL')}
+                >
+                  전체
+                </button>
+              </div>
+            </div>
             <label>
               섹터
               <select value={sectorFilter} onChange={(e) => setSectorFilter(e.target.value)}>

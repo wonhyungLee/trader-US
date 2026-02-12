@@ -69,9 +69,46 @@ def load_universe_csv(path: str, group_name: str, default_market: str, default_e
     return out[["code", "name", "market", "excd", "group_name"]]
 
 
+def _load_sector_seed(store: SQLiteStore, path: str) -> int:
+    seed_path = Path(path)
+    if not seed_path.exists():
+        return 0
+    try:
+        df = pd.read_csv(seed_path)
+    except Exception:
+        return 0
+    if df.empty:
+        return 0
+    cols = {str(c).strip().lower(): c for c in df.columns}
+    code_col = cols.get("code") or cols.get("symbol") or cols.get("ticker") or df.columns[0]
+    sector_col = cols.get("sector_name") or cols.get("sector")
+    industry_col = cols.get("industry_name") or cols.get("industry")
+    source_col = cols.get("source")
+    rows = []
+    for _, r in df.iterrows():
+        code = str(r.get(code_col, "")).strip().upper()
+        if not code:
+            continue
+        rows.append(
+            {
+                "code": code,
+                "sector_code": None,
+                "sector_name": str(r.get(sector_col, "")).strip() if sector_col else None,
+                "industry_code": None,
+                "industry_name": str(r.get(industry_col, "")).strip() if industry_col else None,
+                "source": str(r.get(source_col, "")).strip() if source_col else "WIKI_SEED",
+            }
+        )
+    if not rows:
+        return 0
+    store.upsert_sector_map(rows)
+    return len(rows)
+
+
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--allow-partial", action="store_true", help="600개 미만이어도 강제로 적재(디버그용)")
+    parser.add_argument("--no-sector-seed", action="store_true", help="sector_map_seed.csv 로드 생략")
     args = parser.parse_args()
 
     settings = load_settings()
@@ -79,11 +116,28 @@ def main():
 
     df_nasdaq = load_universe_csv("data/universe_nasdaq100.csv", "NASDAQ100", "NASDAQ", "NAS")
     df_sp = load_universe_csv("data/universe_sp500.csv", "SP500", "SP500", "NYS")
-    df = pd.concat([df_nasdaq, df_sp], ignore_index=True)
+    # 기대값 확인 (각 리스트 개수)
+    if not args.allow_partial:
+        if len(df_nasdaq) != 100 or len(df_sp) != 500:
+            raise RuntimeError(
+                f"universe count mismatch: nasdaq100={len(df_nasdaq)} sp500={len(df_sp)}. "
+                "run scripts/generate_universe_us.py first"
+            )
 
-    # 기대값 확인
-    if len(df) != 600 and not args.allow_partial:
-        raise RuntimeError(f"universe count must be 600, got {len(df)}. run scripts/generate_universe_us.py first")
+    df = pd.concat([df_nasdaq, df_sp], ignore_index=True)
+    # 중복 티커는 그룹명을 합산 (NASDAQ100,SP500)
+    df = (
+        df.groupby("code", as_index=False)
+        .agg(
+            {
+                "name": "first",
+                "market": "first",
+                "excd": "first",
+                "group_name": lambda x: ",".join(sorted({g for g in x if g})),
+            }
+        )
+        .sort_values("code")
+    )
 
     # Snapshot diff 기록
     cur = store.conn.execute("SELECT code, market FROM universe_members")
@@ -105,6 +159,10 @@ def main():
     )
 
     store.upsert_universe_members(df.to_dict(orient="records"))
+    if not args.no_sector_seed:
+        loaded = _load_sector_seed(store, "data/sector_map_seed.csv")
+        if loaded:
+            print(f"✅ sector_map seed loaded: {loaded} rows")
 
     # export
     maybe_export_db(settings, store.db_path)
