@@ -1,0 +1,53 @@
+# BNF Viewer (US) 설정
+
+env: "viewer"
+
+database:
+  path: "data/market_data.db"
+
+kis:
+  env: "prod"
+  base_url_prod: "https://openapi.koreainvestment.com:9443"
+  base_url_paper: "https://openapivts.koreainvestment.com:29443"
+  app_key: "${KIS_APP_KEY}"
+  app_secret: "${KIS_APP_SECRET}"
+  account_no: "${KIS_ACCOUNT_NO}"
+  acnt_prdt_cd: "${KIS_ACNT_PRDT_CD}"
+  custtype: "P"
+  token_cache_path: ".cache/kis_token.json"
+  rate_limit_sleep_sec: 0.1
+  timeout_connect_sec: 5
+  timeout_read_sec: 20
+  max_retries: 8
+  backoff_base_sec: 2
+  backoff_cap_sec: 60
+  backoff_jitter_sec: 0.5
+  consecutive_error_cooldown_after: 10
+  consecutive_error_cooldown_sec: 180
+  auth_forbidden_cooldown_sec: 600
+  session_reset_every: 3
+
+# DB -> CSV export (선택)
+export_csv:
+  enabled: true
+  out_dir: "data/csv"
+  mode: "overwrite"
+  tables: []
+
+# 전략 파라미터 (Selection 화면에 반영)
+# - 코드는 기존 프로젝트 키명을 유지합니다.
+#   (NASDQ100=kospi, S&P500=kosdaq 로 매핑)
+strategy:
+  entry_mode: "mean_reversion"   # mean_reversion | trend_follow
+  rank_mode: "amount"           # amount | ret3 | disparity 등
+  liquidity_rank: 300
+  min_amount: 500000000          # $ 기준 거래대금(대략적인 필터). 필요 시 조정
+  disparity_buy_kospi: -0.05     # NASDAQ100 진입 임계치
+  disparity_buy_kosdaq: -0.06    # S&P500 진입 임계치
+  disparity_sell: -0.01
+  stop_loss: -0.08
+  max_holding_days: 3
+  max_positions: 20
+  max_per_sector: 3
+  trend_ma25_rising: false
+  selection_horizon_days: 1

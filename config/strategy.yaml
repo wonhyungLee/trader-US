@@ -1,0 +1,30 @@
+entry_mode: mean_reversion
+liquidity_rank: 300
+min_amount: 50000000
+
+# 랭킹 방식
+rank_mode: amount
+
+# NOTE: 기존 프로젝트 키명을 유지합니다.
+# - NASDAQ100 = kospi_disparity
+# - S&P500    = kosdaq_disparity
+buy:
+  kospi_disparity: -0.05
+  kosdaq_disparity: -0.06
+  trend_filter:
+    ma25_rising: false
+
+sell:
+  take_profit_disparity: -0.01
+  take_profit_ret: 0.0
+  stop_loss: -0.08
+  max_holding_days: 3
+
+position:
+  max_positions: 20
+  max_per_sector: 3
+  initial_cash: 100000
+  capital_utilization: 1.0
+
+report:
+  selection_horizon_days: 1
