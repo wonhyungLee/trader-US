@@ -6,16 +6,16 @@ import json
 import logging
 import time
 from pathlib import Path
-from typing import Any, Dict, Tuple
+from typing import Any, Dict, Tuple, Optional, List
 
 import numpy as np
 import pandas as pd
-from flask import Flask, jsonify, request, send_from_directory, g
+from flask import Flask, jsonify, request, send_from_directory, g, abort
 from flask_cors import CORS
 
 from src.analyzer.backtest_runner import load_strategy
 from src.storage.sqlite_store import SQLiteStore
-from src.utils.config import load_settings
+from src.utils.config import load_settings, list_kis_key_inventory, set_kis_key_enabled
 from src.utils.db_exporter import maybe_export_db
 from src.utils.project_root import ensure_repo_root
 
@@ -28,9 +28,12 @@ FRONTEND_DIST = Path("frontend/dist")
 UNIVERSE_CACHE_TTL_SEC = int(os.getenv("UNIVERSE_CACHE_TTL_SEC", "300"))
 SECTORS_CACHE_TTL_SEC = int(os.getenv("SECTORS_CACHE_TTL_SEC", "300"))
 SELECTION_CACHE_TTL_SEC = int(os.getenv("SELECTION_CACHE_TTL_SEC", "30"))
+ACCOUNT_SNAPSHOT_PATH = Path("data/account_snapshot.json")
+KIS_TOGGLE_PASSWORD = os.getenv("KIS_TOGGLE_PASSWORD", "lee37535**")
 _universe_cache: Dict[str, Any] = {"ts": 0.0, "rows": None}
 _sectors_cache: Dict[str, Any] = {"ts": 0.0, "rows": None}
 _selection_cache: Dict[str, Any] = {"ts": 0.0, "data": None}
+_balance_cache: Dict[str, Any] = {"ts": 0.0, "data": None}
 
 
 _store = SQLiteStore(str(DB_PATH))
@@ -107,8 +110,198 @@ def _missing_codes(conn: sqlite3.Connection, table: str) -> int:
         return 0
 
 
+def _safe_float(value: Any) -> Optional[float]:
+    if value is None:
+        return None
+    try:
+        if isinstance(value, str):
+            value = value.replace(",", "").strip()
+        return float(value)
+    except Exception:
+        return None
+
+
+def _pick_float(payload: Dict[str, Any], keys: Tuple[str, ...]) -> Optional[float]:
+    for key in keys:
+        if key in payload:
+            val = _safe_float(payload.get(key))
+            if val is not None:
+                return val
+    return None
+
+
+def _latest_price_map(conn: sqlite3.Connection, codes: List[str]) -> Dict[str, Dict[str, Any]]:
+    if not codes:
+        return {}
+    placeholder = ",".join("?" * len(codes))
+    sql = f"""
+        SELECT d.code, d.close, d.date
+        FROM daily_price d
+        JOIN (
+            SELECT code, MAX(date) AS max_date
+            FROM daily_price
+            WHERE code IN ({placeholder})
+            GROUP BY code
+        ) m
+        ON d.code = m.code AND d.date = m.max_date
+    """
+    rows = conn.execute(sql, tuple(codes)).fetchall()
+    out: Dict[str, Dict[str, Any]] = {}
+    for row in rows:
+        out[row[0]] = {"close": row[1], "date": row[2]}
+    return out
+
+
+def _load_account_snapshot() -> Optional[Dict[str, Any]]:
+    if not ACCOUNT_SNAPSHOT_PATH.exists():
+        return None
+    try:
+        return json.loads(ACCOUNT_SNAPSHOT_PATH.read_text(encoding="utf-8"))
+    except Exception:
+        return None
+
+
+def _save_account_snapshot(total_assets: Optional[float]) -> Optional[Dict[str, Any]]:
+    if total_assets is None:
+        return None
+    if ACCOUNT_SNAPSHOT_PATH.exists():
+        return _load_account_snapshot()
+    snapshot = {
+        "connected_at": pd.Timestamp.utcnow().isoformat(),
+        "initial_total": total_assets,
+    }
+    try:
+        ACCOUNT_SNAPSHOT_PATH.write_text(json.dumps(snapshot, ensure_ascii=False, indent=2), encoding="utf-8")
+    except Exception:
+        pass
+    return snapshot
+
+
+def _fetch_live_balance(settings: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+    try:
+        from src.brokers.kis_broker import KISBroker
+    except Exception:
+        return None
+    try:
+        broker = KISBroker(settings)
+        if not hasattr(broker, "get_balance"):
+            return None
+        return broker.get_balance()
+    except Exception:
+        return None
+
+
+def _build_account_summary(conn: sqlite3.Connection, settings: Dict[str, Any]) -> Dict[str, Any]:
+    now_ts = time.time()
+    if _balance_cache.get("data") and now_ts - _balance_cache.get("ts", 0) < 120:
+        return _balance_cache["data"]
+
+    resp = _fetch_live_balance(settings)
+    if not resp:
+        data = {"connected": False, "reason": "balance_unavailable"}
+        _balance_cache.update({"ts": now_ts, "data": data})
+        return data
+
+    output2 = resp.get("output2") or resp.get("output") or []
+    summary = output2[0] if isinstance(output2, list) and output2 else (output2 if isinstance(output2, dict) else {})
+    cash = _pick_float(summary, ("prcs_bal", "dnca_tot_amt", "cash_bal", "cash_bal_amt"))
+    total_eval = _pick_float(summary, ("tot_evlu_amt", "tot_asst_evlu_amt"))
+    total_pnl = _pick_float(summary, ("tot_pfls", "tot_pfls_amt"))
+
+    positions = resp.get("output1") or []
+    codes: List[str] = []
+    parsed_positions = []
+    for p in positions:
+        code = p.get("pdno") or p.get("PDNO")
+        if not code:
+            continue
+        codes.append(code)
+        parsed_positions.append({
+            "code": code,
+            "name": p.get("prdt_name") or p.get("PRDT_NAME") or "",
+            "qty": int(float(p.get("hldg_qty") or p.get("HLDG_QTY") or 0)),
+            "avg_price": _safe_float(p.get("pchs_avg_pric") or p.get("PCHS_AVG_PRIC")),
+            "eval_amount": _safe_float(p.get("evlu_amt") or p.get("EVLU_AMT")),
+        })
+
+    price_map = _latest_price_map(conn, list(set(codes)))
+    positions_value = 0.0
+    for p in parsed_positions:
+        if p["eval_amount"] is not None:
+            positions_value += p["eval_amount"]
+            continue
+        last_close = price_map.get(p["code"], {}).get("close")
+        if last_close is not None:
+            positions_value += last_close * (p["qty"] or 0)
+
+    if total_eval is None:
+        total_eval = (cash or 0.0) + positions_value
+    if total_pnl is None and total_eval is not None:
+        cost = sum((p.get("avg_price") or 0) * (p.get("qty") or 0) for p in parsed_positions)
+        total_pnl = total_eval - cost if cost else None
+
+    snapshot = _save_account_snapshot(total_eval)
+    since_pnl = None
+    since_pct = None
+    connected_at = None
+    if snapshot and total_eval is not None:
+        connected_at = snapshot.get("connected_at")
+        initial_total = snapshot.get("initial_total") or 0
+        since_pnl = total_eval - initial_total
+        since_pct = (since_pnl / initial_total * 100) if initial_total else None
+
+    data = {
+        "connected": True,
+        "connected_at": connected_at,
+        "summary": {
+            "cash": cash,
+            "positions_value": positions_value,
+            "total_assets": total_eval,
+            "total_pnl": total_pnl,
+            "total_pnl_pct": (total_pnl / total_eval * 100) if total_pnl is not None and total_eval else None,
+        },
+        "since_connected": {
+            "pnl": since_pnl,
+            "pnl_pct": since_pct,
+        },
+    }
+    _balance_cache.update({"ts": now_ts, "data": data})
+    return data
+
+
 app = Flask(__name__, static_folder=str(FRONTEND_DIST), static_url_path="")
-CORS(app, resources={r"/*": {"origins": "*"}})
+
+def _admin_enabled() -> bool:
+    return bool(os.getenv("ADMIN_TOKEN", "").strip())
+
+
+def _is_admin_request() -> bool:
+    token = os.getenv("ADMIN_TOKEN", "").strip()
+    if not token:
+        return False
+    provided = request.headers.get("X-Admin-Token") or request.args.get("token") or ""
+    return str(provided).strip() == token
+
+
+def _require_admin_or_404() -> None:
+    # If admin token isn't configured, hide the endpoint entirely.
+    if not _admin_enabled():
+        abort(404)
+    if not _is_admin_request():
+        abort(404)
+
+
+def _check_password(password: Optional[str]) -> bool:
+    if not KIS_TOGGLE_PASSWORD:
+        return True
+    return bool(password) and password == KIS_TOGGLE_PASSWORD
+
+
+cors_origins = os.getenv("CORS_ORIGINS", "").strip()
+if cors_origins:
+    origins = [o.strip() for o in cors_origins.split(",") if o.strip()]
+    if origins:
+        CORS(app, resources={r"/*": {"origins": origins}})
 
 app.teardown_appcontext(_close_db)
 
@@ -221,6 +414,165 @@ def prices():
     return jsonify(df.to_dict(orient="records"))
 
 
+@app.get("/portfolio")
+def portfolio():
+    conn = get_db()
+    try:
+        df = pd.read_sql_query(
+            """
+            SELECT p.code, p.name, p.qty, p.avg_price, p.entry_date, p.updated_at,
+                   u.market, s.sector_name, s.industry_name
+            FROM position_state p
+            LEFT JOIN universe_members u ON p.code = u.code
+            LEFT JOIN sector_map s ON p.code = s.code
+            ORDER BY p.updated_at DESC
+            """,
+            conn,
+        )
+    except Exception:
+        return jsonify({"positions": [], "totals": {"positions_value": 0, "cost": 0, "pnl": None, "pnl_pct": None}})
+
+    codes = df["code"].dropna().astype(str).unique().tolist() if not df.empty else []
+    price_map = _latest_price_map(conn, codes)
+    records = []
+    total_value = 0.0
+    total_cost = 0.0
+    for row in df.to_dict(orient="records"):
+        code = row.get("code")
+        last = price_map.get(code, {})
+        last_close = last.get("close")
+        last_date = last.get("date")
+        qty = float(row.get("qty") or 0)
+        avg_price = float(row.get("avg_price") or 0)
+        cost = qty * avg_price if qty and avg_price else None
+        market_value = qty * last_close if qty and last_close is not None else None
+        pnl = market_value - cost if market_value is not None and cost is not None else None
+        pnl_pct = (pnl / cost * 100) if pnl is not None and cost else None
+        if market_value is not None:
+            total_value += market_value
+        if cost is not None:
+            total_cost += cost
+        row.update(
+            {
+                "last_close": last_close,
+                "last_date": last_date,
+                "market_value": market_value,
+                "pnl": pnl,
+                "pnl_pct": pnl_pct,
+            }
+        )
+        records.append(row)
+
+    totals = {
+        "positions_value": total_value,
+        "cost": total_cost,
+        "pnl": total_value - total_cost if total_cost else None,
+        "pnl_pct": ((total_value - total_cost) / total_cost * 100) if total_cost else None,
+    }
+    return jsonify({"positions": records, "totals": totals})
+
+
+@app.get("/plans")
+def plans():
+    conn = get_db()
+    exec_date = request.args.get("exec_date")
+    if not exec_date:
+        try:
+            exec_date = conn.execute("SELECT MAX(exec_date) FROM order_queue").fetchone()[0]
+        except Exception:
+            exec_date = None
+    if not exec_date:
+        return jsonify({"exec_date": None, "buys": [], "sells": []})
+
+    try:
+        df = pd.read_sql_query(
+            """
+            SELECT o.id, o.signal_date, o.exec_date, o.code, o.side, o.qty, o.rank, o.status,
+                   o.ord_dvsn, o.ord_unpr, o.created_at, o.updated_at,
+                   u.name, u.market, s.sector_name, s.industry_name
+            FROM order_queue o
+            LEFT JOIN universe_members u ON o.code = u.code
+            LEFT JOIN sector_map s ON o.code = s.code
+            WHERE o.exec_date = ? AND o.status IN ('PENDING','SENT','PARTIAL','NOT_FOUND')
+            ORDER BY o.rank ASC, o.id ASC
+            """,
+            conn,
+            params=(exec_date,),
+        )
+    except Exception:
+        return jsonify({"exec_date": exec_date, "buys": [], "sells": [], "counts": {"buys": 0, "sells": 0}})
+
+    codes = df["code"].dropna().astype(str).unique().tolist() if not df.empty else []
+    price_map = _latest_price_map(conn, codes)
+    buys = []
+    sells = []
+    for row in df.to_dict(orient="records"):
+        code = row.get("code")
+        last = price_map.get(code, {})
+        planned_price = row.get("ord_unpr") if row.get("ord_unpr") else last.get("close")
+        row.update(
+            {
+                "planned_price": planned_price,
+                "last_close": last.get("close"),
+                "last_date": last.get("date"),
+            }
+        )
+        if row.get("side") == "SELL":
+            sells.append(row)
+        else:
+            buys.append(row)
+
+    return jsonify(
+        {
+            "exec_date": exec_date,
+            "buys": buys,
+            "sells": sells,
+            "counts": {"buys": len(buys), "sells": len(sells)},
+        }
+    )
+
+
+@app.get("/account")
+def account():
+    conn = get_db()
+    settings = load_settings()
+    return jsonify(_build_account_summary(conn, settings))
+
+
+@app.get("/kis_keys")
+def kis_keys():
+    inventory = list_kis_key_inventory()
+    enriched = []
+    for item in inventory:
+        row = dict(item)
+        row["account"] = item.get("account_no_masked") or item.get("label")
+        row.setdefault("env", "real")
+        enriched.append(row)
+    return jsonify(enriched)
+
+
+@app.post("/kis_keys/toggle")
+def kis_keys_toggle():
+    payload = request.get_json(silent=True) or {}
+    if not _check_password(payload.get("password")):
+        return jsonify({"error": "invalid_password"}), 403
+    try:
+        idx = int(payload.get("id"))
+    except Exception:
+        return jsonify({"error": "invalid_id"}), 400
+    if idx < 1 or idx > 50:
+        return jsonify({"error": "invalid_id"}), 400
+    enabled = bool(payload.get("enabled"))
+    updated = set_kis_key_enabled(idx, enabled)
+    enriched = []
+    for item in updated:
+        row = dict(item)
+        row["account"] = item.get("account_no_masked") or item.get("label")
+        row.setdefault("env", "real")
+        enriched.append(row)
+    return jsonify(enriched)
+
+
 def _build_selection_summary(conn: sqlite3.Connection, settings: Dict[str, Any]) -> Dict[str, Any]:
     """Buy candidates only (no auto-trading / no account)."""
     params = load_strategy(settings)
@@ -266,6 +618,16 @@ def _build_selection_summary(conn: sqlite3.Connection, settings: Dict[str, Any])
     total = len(latest)
 
     stage = latest
+    # Attach sector/industry early so max_per_sector works as intended.
+    try:
+        sector_df = pd.read_sql_query(
+            "SELECT code, COALESCE(sector_name,'UNKNOWN') AS sector_name, industry_name FROM sector_map",
+            conn,
+        )
+        stage = stage.merge(sector_df, on="code", how="left")
+    except Exception:
+        stage["sector_name"] = None
+        stage["industry_name"] = None
     if min_amount:
         stage = stage[stage["amount"] >= min_amount]
 
@@ -311,14 +673,22 @@ def _build_selection_summary(conn: sqlite3.Connection, settings: Dict[str, Any])
     final_rows = []
     sector_counts: Dict[str, int] = {}
     try:
-        held = conn.execute("SELECT code FROM position_state").fetchall()
-        for (code,) in held:
-            sec = group_map.get(code) or "UNKNOWN"
+        held = conn.execute(
+            """
+            SELECT p.code,
+                   COALESCE(s.sector_name, u.group_name, 'UNKNOWN') AS sec
+            FROM position_state p
+            LEFT JOIN sector_map s ON p.code = s.code
+            LEFT JOIN universe_members u ON p.code = u.code
+            """
+        ).fetchall()
+        for code, sec in held:
+            sec = sec or "UNKNOWN"
             sector_counts[sec] = sector_counts.get(sec, 0) + 1
     except Exception:
         sector_counts = {}
     for _, row in ranked.iterrows():
-        sec = row.get("sector_name") or row.get("group_name") or "UNKNOWN"
+        sec = row.get("sector_name") or "UNKNOWN"
         if max_per_sector and sector_counts.get(sec, 0) >= max_per_sector:
             continue
         final_rows.append(row)
@@ -400,6 +770,7 @@ def status():
 
 @app.get("/jobs")
 def jobs():
+    _require_admin_or_404()
     conn = get_db()
     limit = int(request.args.get("limit", 20))
     df = pd.read_sql_query("SELECT * FROM job_runs ORDER BY started_at DESC LIMIT ?", conn, params=(limit,))
@@ -432,7 +803,10 @@ def strategy():
 
 @app.post("/export")
 def export_csv():
+    _require_admin_or_404()
     settings = load_settings()
+    if not (settings.get("export_csv") or {}).get("enabled", False):
+        abort(404)
     maybe_export_db(settings, str(DB_PATH))
     return jsonify({"status": "success", "message": "CSV export completed"})
 
