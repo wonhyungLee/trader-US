@@ -349,15 +349,34 @@ class KISBroker:
                 else:
                     resp = sess.session.post(url, headers=headers, params=params, data=data, json=json_body, timeout=timeout)
 
-                # KIS quirk: sometimes returns 500 for expired token
+                # KIS quirk: sometimes returns 500 for expired token / rate limit.
                 is_token_expired = False
+                status_msg_cd = ""
                 if resp.status_code == 500:
                     try:
                         err_data = resp.json()
-                        if err_data.get("msg_cd") == "EGW00123": # 기간이 만료된 token 입니다.
+                        status_msg_cd = str(err_data.get("msg_cd") or "")
+                        if status_msg_cd == "EGW00123":  # 기간이 만료된 token 입니다.
                             is_token_expired = True
                     except Exception:
                         pass
+
+                if resp.status_code == 500:
+                    cool = float(self.consecutive_error_cooldown_sec)
+                    if cool > 0:
+                        logging.warning(
+                            "KIS 500 (%s) for key %s. Cooling down %.1fs, clearing token cache and resetting sessions.",
+                            status_msg_cd,
+                            sess.app_key[:8],
+                            cool,
+                        )
+                        time.sleep(max(1.0, cool))
+                    else:
+                        time.sleep(1.0)
+                    self.clear_token_cache()
+                    self.reset_sessions()
+                    if is_retryable_status(resp.status_code):
+                        raise HTTPError(f"{resp.status_code} retryable", response=resp)
 
                 if (resp.status_code in (401, 403) or is_token_expired):
                     if resp.status_code == 403:
@@ -428,6 +447,22 @@ class KISBroker:
         for idx, code in enumerate(codes[:30], start=1):
             params[f"FID_COND_MRKT_DIV_CODE_{idx}"] = "J"
             params[f"FID_INPUT_ISCD_{idx}"] = code
+        return self.request(tr_id, url, params=params)
+
+    # --------------- Overseas quotes ---------------
+    @staticmethod
+    def normalize_overseas_symbol(symbol: str) -> str:
+        # KIS overseas APIs use slash for class shares (e.g., BRK/B).
+        return str(symbol or "").strip().upper().replace(".", "/")
+
+    def get_overseas_current_price(self, excd: str, symbol: str) -> Dict[str, Any]:
+        url = f"{self.base_url}/uapi/overseas-price/v1/quotations/price"
+        tr_id = "HHDFS00000300"
+        params = {
+            "AUTH": "",
+            "EXCD": str(excd or "").strip().upper(),
+            "SYMB": self.normalize_overseas_symbol(symbol),
+        }
         return self.request(tr_id, url, params=params)
 
 

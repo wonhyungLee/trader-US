@@ -12,11 +12,18 @@ from typing import Any, Dict, List, Optional, Tuple
 
 import requests
 
-from src.autotrade.engine_adapter import recommend_daytrade_plan
 from src.autotrade.info_loader import AutoTradeInfo, load_autotrade_info
 from src.autotrade.payloads import build_limit_order, infer_exchange, infer_quote_currency
 from src.autotrade.price_feed import fetch_current_price_us
 from src.analyzer.backtest_runner import load_strategy
+from src.daytrade.planner import (
+    build_orders_from_plans,
+    build_traderus_selection,
+    compute_plan_for_code,
+    load_daytrade_cfg,
+    next_business_day,
+    resolve_total_assets,
+)
 from src.storage.sqlite_store import SQLiteStore, normalize_code
 from src.utils.config import load_settings
 from src.utils.notifier import maybe_notify
@@ -447,127 +454,213 @@ def _expire_and_purge_queue(store: SQLiteStore, cfg: AutoTradeConfig) -> Tuple[i
     return int(expired_cur.rowcount or 0), int(purged_cur.rowcount or 0)
 
 
-def _ensure_plan_and_queue_for_code(store: SQLiteStore, cfg: AutoTradeConfig, code: str) -> Optional[str]:
-    latest_date = store.last_price_date(code)
-    if not latest_date:
-        return None
+def _sync_daytrade_plans_and_queue(
+    store: SQLiteStore,
+    cfg: AutoTradeConfig,
+    settings: dict,
+    managed_selected: Optional[set[str]],
+) -> Dict[str, Any]:
+    """Generate queue from TraderUS selection + daytrade(balanced) planner."""
+    daytrade_cfg = load_daytrade_cfg(settings)
+    if not bool(daytrade_cfg.get("enabled", False)):
+        return {"ok": False, "reason": "daytrade_disabled"}
 
-    code = normalize_code(code)
-    existing = store.conn.execute(
-        "SELECT 1 FROM autotrade_plans WHERE asof_date=? AND code=?",
-        (latest_date, code),
-    ).fetchone()
-    plan_row = None
-    if existing:
-        plan_row = store.conn.execute(
-            "SELECT entry_price, target_price, stop_price, confidence, status, plan_json FROM autotrade_plans WHERE asof_date=? AND code=?",
-            (latest_date, code),
-        ).fetchone()
+    signal_date = _latest_price_date(store)
+    if not signal_date:
+        return {"ok": False, "reason": "no_price_data"}
 
-    if plan_row:
-        entry_price = plan_row[0]
-        target_price = plan_row[1]
-        stop_price = plan_row[2]
-        confidence = plan_row[3]
-        status = plan_row[4] or ""
-        plan_json = plan_row[5] or ""
+    latest_sel_date, sel_df = build_traderus_selection(store.conn, settings)
+    if sel_df.empty:
+        cancelled = _cancel_missing_selected_buys(store, set(), "no_daytrade_candidates")
+        return {"ok": True, "signal_date": signal_date, "orders_count": 0, "cancelled": cancelled}
+    if latest_sel_date and latest_sel_date != signal_date:
+        logging.warning(
+            "[autotrade] selection latest date differs: selection=%s daily=%s",
+            latest_sel_date,
+            signal_date,
+        )
+
+    if managed_selected is not None:
+        allowed_codes = set(managed_selected)
     else:
-        rec = recommend_daytrade_plan(
-            db_path=cfg.db_path,
-            code=code,
-            optimize=cfg.optimize,
-            optimize_lookback_bars=cfg.optimize_lookback_bars,
-        )
-        if not rec.get("ok"):
-            logging.info("[autotrade] recommend failed for %s: %s", code, rec.get("error"))
-            return None
-        snap = rec.get("snapshot") or {}
-        asof_date = str(snap.get("date") or latest_date)
-        plan = rec.get("plan") or {}
-        entry_price = plan.get("entry_price")
-        target_price = plan.get("target_price")
-        stop_price = plan.get("stop_price")
-        confidence = rec.get("confidence")
-        status = rec.get("status") or ""
-        plan_json = json.dumps(rec, ensure_ascii=False, default=str)
-        store.upsert_autotrade_plan(
-            asof_date=asof_date,
-            code=code,
-            entry_price=float(entry_price) if entry_price is not None else None,
-            target_price=float(target_price) if target_price is not None else None,
-            stop_price=float(stop_price) if stop_price is not None else None,
-            confidence=float(confidence) if confidence is not None else None,
-            status=str(status),
-            plan_json=plan_json,
-        )
-        latest_date = asof_date
+        wl_rows = store.list_autotrade_watchlist(list_type=LIST_SELECTED, enabled_only=True)
+        allowed_codes = {
+            normalize_code(r["code"])
+            for r in wl_rows
+            if r and r["code"]
+        }
+        if not allowed_codes:
+            allowed_codes = {
+                normalize_code(c)
+                for c in sel_df["code"].astype(str).tolist()
+            }
 
-    # Queue payloads (idempotent upsert)
-    name, market, excd = _enrich_symbol(store, code)
-    exchange = infer_exchange(excd, code)
-    quote = infer_quote_currency(code)
-    order_name = f"{name or code} 매매"
+    ex = daytrade_cfg.get("execution") or {}
+    max_orders = max(1, int(ex.get("max_orders_per_day", 5)))
+    min_atr_pct = float(ex.get("min_atr_pct", 0.0) or 0.0)
+
+    plans = []
+    for _, row in sel_df.iterrows():
+        code = normalize_code(row.get("code"))
+        if code not in allowed_codes:
+            continue
+        rank = int(row.get("rank") or 0)
+        plan = compute_plan_for_code(
+            store.conn,
+            code=code,
+            rank=rank,
+            signal_date=signal_date,
+            daytrade_cfg=daytrade_cfg,
+        )
+        if not plan:
+            continue
+        if (min_atr_pct > 0) and (float(plan.atr_pct) < min_atr_pct):
+            continue
+        plans.append(plan)
+
+    plans.sort(key=lambda p: p.rank)
+    plans = plans[:max_orders]
+
+    total_assets = resolve_total_assets(settings)
+    exec_date = next_business_day(signal_date)
+    planner_orders = build_orders_from_plans(
+        plans,
+        daytrade_cfg=daytrade_cfg,
+        total_assets=total_assets,
+        exec_date=exec_date,
+        signal_date=signal_date,
+    )
 
     info = AutoTradeInfo(webhook_url=cfg.webhook_url, password=cfg.password, kis_number=cfg.kis_number)
     if not info.webhook_url or not info.password or not info.kis_number:
-        logging.warning("[autotrade] missing webhook config (url/password/kis_number). url=%s", bool(info.webhook_url))
-        return latest_date
+        logging.warning(
+            "[autotrade] missing webhook config (url/password/kis_number). url=%s",
+            bool(info.webhook_url),
+        )
+        return {
+            "ok": False,
+            "reason": "webhook_config_missing",
+            "signal_date": signal_date,
+            "orders_count": len(planner_orders),
+        }
 
-    if entry_price is not None:
+    planned_codes: set[str] = set()
+    for od in planner_orders:
+        code = normalize_code(od.get("code"))
+        if not code:
+            continue
+        entry_price = _to_float(od.get("ord_unpr"))
+        if entry_price is None or entry_price <= 0:
+            continue
+        target_price = _to_float(od.get("target_unpr"))
+        stop_price = _to_float(od.get("stop_unpr"))
+        qty = int(od.get("qty") or cfg.default_amount or 1)
+        if qty <= 0:
+            qty = max(1, int(cfg.default_amount))
+
+        store.upsert_autotrade_plan(
+            asof_date=signal_date,
+            code=code,
+            entry_price=entry_price,
+            target_price=target_price,
+            stop_price=stop_price,
+            confidence=None,
+            status="READY",
+            plan_json=str(od.get("meta_json") or "{}"),
+        )
+
+        name, market, excd = _enrich_symbol(store, code)
+        exchange = infer_exchange(excd, code)
+        quote = infer_quote_currency(code)
+        order_name = f"{name or code} 매매"
+
         payload = build_limit_order(
             password=info.password,
             exchange=exchange,
             base=code,
             quote=quote,
             side="buy",
-            amount=cfg.default_amount,
+            amount=qty,
             price=float(entry_price),
             order_name=order_name,
             kis_number=info.kis_number,
         )
+        existing_buy = store.conn.execute(
+            "SELECT status FROM autotrade_queue WHERE asof_date=? AND code=? AND side='BUY'",
+            (signal_date, code),
+        ).fetchone()
+        if existing_buy and str(existing_buy[0] or "").upper() in {"SENT", "SENDING"}:
+            planned_codes.add(code)
+            continue
         store.upsert_autotrade_queue(
-            asof_date=latest_date,
+            asof_date=signal_date,
             code=code,
             side="BUY",
             trigger_price=float(payload.get("price") or 0),
             trigger_rule="<=",
             webhook_url=info.webhook_url,
             payload_json=json.dumps(payload, ensure_ascii=False, separators=(",", ":"), default=str),
+            status="PENDING",
         )
 
-    if cfg.generate_sell_queue and target_price is not None:
-        payload = build_limit_order(
-            password=info.password,
-            exchange=exchange,
-            base=code,
-            quote=quote,
-            side="sell",
-            amount=cfg.default_amount,
-            price=float(target_price),
-            order_name=order_name,
-            kis_number=info.kis_number,
-        )
-        store.upsert_autotrade_queue(
-            asof_date=latest_date,
-            code=code,
-            side="SELL",
-            trigger_price=float(payload.get("price") or 0),
-            trigger_rule=">=",
-            webhook_url=info.webhook_url,
-            payload_json=json.dumps(payload, ensure_ascii=False, separators=(",", ":"), default=str),
-        )
+        if cfg.generate_sell_queue and target_price is not None:
+            sell_payload = build_limit_order(
+                password=info.password,
+                exchange=exchange,
+                base=code,
+                quote=quote,
+                side="sell",
+                amount=qty,
+                price=float(target_price),
+                order_name=order_name,
+                kis_number=info.kis_number,
+            )
+            existing_sell = store.conn.execute(
+                "SELECT status FROM autotrade_queue WHERE asof_date=? AND code=? AND side='SELL'",
+                (signal_date, code),
+            ).fetchone()
+            if existing_sell and str(existing_sell[0] or "").upper() in {"SENT", "SENDING"}:
+                continue
+            store.upsert_autotrade_queue(
+                asof_date=signal_date,
+                code=code,
+                side="SELL",
+                trigger_price=float(sell_payload.get("price") or 0),
+                trigger_rule=">=",
+                webhook_url=info.webhook_url,
+                payload_json=json.dumps(sell_payload, ensure_ascii=False, separators=(",", ":"), default=str),
+                status="PENDING",
+            )
 
-    # Store any missing metadata back to watchlist row for UI.
-    store.upsert_autotrade_watchlist(
-        code,
-        name=name,
-        market=market,
-        excd=excd,
-        list_type=(store.conn.execute("SELECT list_type FROM autotrade_watchlist WHERE code=?", (code,)).fetchone() or ["SELECTED"])[0],
-        enabled=True,
-    )
+        # Keep metadata in watchlist for UI.
+        list_type_row = store.conn.execute(
+            "SELECT list_type FROM autotrade_watchlist WHERE code=?",
+            (code,),
+        ).fetchone()
+        list_type = str((list_type_row[0] if list_type_row else LIST_SELECTED) or LIST_SELECTED).upper()
+        store.upsert_autotrade_watchlist(
+            code,
+            name=name,
+            market=market,
+            excd=excd,
+            list_type=list_type,
+            enabled=True,
+        )
+        planned_codes.add(code)
 
-    return latest_date
+    cancelled = 0
+    if cfg.cancel_missing_selected:
+        cancelled = _cancel_missing_selected_buys(store, planned_codes, "cancelled_not_in_daytrade_plan")
+        if cancelled:
+            logging.info("[autotrade] cancelled BUY queue not in daytrade plans=%s", cancelled)
+
+    return {
+        "ok": True,
+        "signal_date": signal_date,
+        "exec_date": exec_date,
+        "orders_count": len(planned_codes),
+        "cancelled": cancelled,
+    }
 
 
 def _latest_queue_asof_per_code(store: SQLiteStore) -> Dict[str, str]:
@@ -760,6 +853,68 @@ def _fetch_current_prices_kr(settings: dict, codes: List[str]) -> Dict[str, Dict
     return out
 
 
+def _resolve_us_excd_map(store: SQLiteStore, codes: List[str]) -> Dict[str, str]:
+    targets = [normalize_code(c) for c in codes if str(c).strip()]
+    if not targets:
+        return {}
+    out: Dict[str, str] = {c: "" for c in targets}
+
+    placeholders = ",".join(["?"] * len(targets))
+    wl_rows = store.conn.execute(
+        f"SELECT code, COALESCE(excd, '') FROM autotrade_watchlist WHERE code IN ({placeholders})",
+        tuple(targets),
+    ).fetchall()
+    for row in wl_rows:
+        code = normalize_code(row[0])
+        excd = str(row[1] or "").strip().upper()
+        if code in out and excd:
+            out[code] = excd
+
+    missing = [c for c, e in out.items() if not e]
+    if not missing:
+        return out
+
+    placeholders2 = ",".join(["?"] * len(missing))
+    uni_rows = store.conn.execute(
+        f"SELECT code, COALESCE(excd, '') FROM universe_members WHERE code IN ({placeholders2})",
+        tuple(missing),
+    ).fetchall()
+    for row in uni_rows:
+        code = normalize_code(row[0])
+        excd = str(row[1] or "").strip().upper()
+        if code in out and excd:
+            out[code] = excd
+
+    return out
+
+
+def _fetch_current_prices_us(store: SQLiteStore, settings: dict, codes: List[str]) -> Dict[str, Dict[str, Any]]:
+    out: Dict[str, Dict[str, Any]] = {}
+    if not codes:
+        return out
+
+    code_excd = _resolve_us_excd_map(store, codes)
+    try:
+        from src.brokers.kis_broker import KISBroker
+
+        broker = KISBroker(settings)
+    except Exception as exc:
+        logging.warning("[autotrade] KISBroker unavailable for US quotes: %s", exc)
+        for code in codes:
+            out[code] = {"code": code, "price": None, "asof": None, "source": "kis"}
+        return out
+
+    for code in codes:
+        out[code] = fetch_current_price_us(
+            code,
+            settings=settings,
+            excd=code_excd.get(code),
+            broker=broker,
+            allow_fallback=False,
+        )
+    return out
+
+
 def run_cycle(store: SQLiteStore, settings: dict, cfg: AutoTradeConfig, *, dry_run: bool = False) -> None:
     if not cfg.enabled:
         return
@@ -779,12 +934,9 @@ def run_cycle(store: SQLiteStore, settings: dict, cfg: AutoTradeConfig, *, dry_r
         if cancelled_sell:
             logging.info("[autotrade] cancelled pending SELL queue=%s", cancelled_sell)
 
-    watch = store.list_autotrade_watchlist(enabled_only=True)
-    for row in watch:
-        code = str(row["code"] or "").strip().upper()
-        if not code:
-            continue
-        _ensure_plan_and_queue_for_code(store, cfg, code)
+    sync_res = _sync_daytrade_plans_and_queue(store, cfg, settings, managed_selected)
+    if not sync_res.get("ok"):
+        logging.info("[autotrade] daytrade queue sync skipped: %s", sync_res)
 
     candidates = _list_dispatch_candidates(store)
     if not candidates:
@@ -801,8 +953,8 @@ def run_cycle(store: SQLiteStore, settings: dict, cfg: AutoTradeConfig, *, dry_r
     price_map: Dict[str, Dict[str, Any]] = {}
     if kr_codes:
         price_map.update(_fetch_current_prices_kr(settings, kr_codes))
-    for c in us_codes:
-        price_map[c] = fetch_current_price_us(c)
+    if us_codes:
+        price_map.update(_fetch_current_prices_us(store, settings, us_codes))
 
     for code, items in by_code.items():
         price_rec = price_map.get(code) or {}
@@ -842,7 +994,11 @@ def run_cycle(store: SQLiteStore, settings: dict, cfg: AutoTradeConfig, *, dry_r
             try:
                 payload = json.loads(payload_raw) if payload_raw else {}
             except Exception:
-                payload = {}
+                _mark_result(store, order_id=int(it["id"]), status="ERROR", error_text="payload_json_invalid")
+                continue
+            if not isinstance(payload, dict):
+                _mark_result(store, order_id=int(it["id"]), status="ERROR", error_text="payload_json_not_object")
+                continue
             try:
                 ok, http_status, body = _send_webhook(url, payload)
                 if ok:

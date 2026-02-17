@@ -316,7 +316,7 @@ INDEXES = [
 
 class SQLiteStore:
     def __init__(self, db_path: str = "data/market_data.db"):
-        os.makedirs(os.path.dirname(db_path), exist_ok=True)
+        os.makedirs(os.path.dirname(db_path) or ".", exist_ok=True)
         self.db_path = db_path
         self.conn = sqlite3.connect(self.db_path, timeout=5, check_same_thread=False)
         self.conn.execute("PRAGMA journal_mode=WAL;")
@@ -885,6 +885,12 @@ class SQLiteStore:
                 trigger_rule=excluded.trigger_rule,
                 webhook_url=excluded.webhook_url,
                 payload_json=excluded.payload_json,
+                status=excluded.status,
+                attempt_count=0,
+                last_attempt_at=NULL,
+                sent_at=NULL,
+                response_text=NULL,
+                last_error=NULL,
                 updated_at=excluded.updated_at;
             """,
             (

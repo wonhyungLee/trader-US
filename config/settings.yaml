@@ -114,6 +114,18 @@ autotrade:
   cancel_missing_selected: true
   # 이탈(SELL) 자동큐는 생성/발송하지 않습니다.
   generate_sell_queue: false
+  # monitor_state.json(웹소켓/스캐너 캐시)에 최근 가격이 있으면 REST보다 우선 사용
+  use_ws_cache_for_price: true
+  # 웹소켓 캐시 허용 신선도(초)
+  ws_cache_max_age_sec: 90
+  # 미국주식 websocket 캐시 프로세스 설정 (python -m src.autotrade.us_ws_cache)
+  us_ws_cache:
+    tr_id: "HDFSCNT0"
+    # D: 무료/지연(미국 0분지연), R: 유료/주간시장 코드
+    tr_key_prefix: "D"
+    refresh_targets_sec: 300
+    max_targets: 20
+    save_interval_sec: 1.0
   # 지난 큐 정리 보존일(일): EXPIRED/CANCELLED 큐 삭제 기준.
   purge_expired_after_days: 1
   # 엔진 per-code 그리드서치(느림). watchlist가 작을 때만 권장.
