@@ -85,6 +85,13 @@ watchdog:
   daily_stale_days: 2
   daily_chunk_days: 90
   daily_cooldown_sec: 1800
+  # 폐장 후 ET 기준 N분 지난 뒤 "당일 종가 존재 여부"를 샘플 종목으로 탐지
+  market_probe_enabled: true
+  market_probe_after_close_min: 45
+  # 샘플 탐지 재시도 횟수(0건이 계속되면 휴장 추정)
+  market_probe_retry_limit: 6
+  # 탐지용 샘플 코드 수(1건이라도 생기면 거래일로 판단 후 전체 결손 채움)
+  market_probe_sample_size: 20
   invalid_latest_enabled: true
   invalid_latest_amount_threshold: 0
   invalid_latest_volume_threshold: 0
