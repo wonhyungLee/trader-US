@@ -22,7 +22,7 @@ sell:
 
 position:
   max_positions: 20
-  max_per_sector: 3
+  max_per_sector: 1
   initial_cash: 100000
   capital_utilization: 1.0
 
@@ -72,4 +72,3 @@ daytrade:
     min_atr_pct: 0.0
     # 지정가 주문 코드(브로커/시장별로 다를 수 있음)
     ord_dvsn: "00"
-

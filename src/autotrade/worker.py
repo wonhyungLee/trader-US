@@ -179,7 +179,7 @@ def _selected_codes_from_strategy(store: SQLiteStore, settings: dict, limit: int
     SELECT dp.code,
            COALESCE(u.market, '') AS market,
            COALESCE(u.group_name, 'UNKNOWN') AS group_name,
-           COALESCE(sm.industry_name, sm.sector_name, u.group_name, 'UNKNOWN') AS sector_name,
+           COALESCE(sm.sector_name, u.group_name, 'UNKNOWN') AS sector_name,
            CAST(COALESCE(dp.amount, 0) AS REAL) AS amount,
            CAST(COALESCE(dp.disparity, 0) AS REAL) AS disparity,
            CAST(COALESCE(dp.ma25, 0) AS REAL) AS ma25,
@@ -282,7 +282,7 @@ def _selected_codes_from_strategy(store: SQLiteStore, settings: dict, limit: int
         held_rows = store.conn.execute(
             """
             SELECT p.code,
-                   COALESCE(sm.industry_name, sm.sector_name, u.group_name, 'UNKNOWN') AS sector_name
+                   COALESCE(sm.sector_name, u.group_name, 'UNKNOWN') AS sector_name
             FROM position_state p
             LEFT JOIN sector_map sm ON p.code = sm.code
             LEFT JOIN universe_members u ON p.code = u.code

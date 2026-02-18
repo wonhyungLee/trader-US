@@ -71,7 +71,7 @@ strategy:
   stop_loss: -0.08
   max_holding_days: 3
   max_positions: 20
-  max_per_sector: 3
+  max_per_sector: 1
   trend_ma25_rising: false
   selection_horizon_days: 1
 
