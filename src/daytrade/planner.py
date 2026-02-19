@@ -329,6 +329,8 @@ def compute_plan_for_code(
     signal_date: str,
     daytrade_cfg: Dict[str, Any],
     min_bars: int = 260,
+    enforce_signal_trigger: bool = True,
+    fallback_to_latest_before_signal_date: bool = False,
 ) -> Optional[DaytradePlan]:
     sig = daytrade_cfg.get("signal") or {}
     br = daytrade_cfg.get("bracket") or {}
@@ -350,10 +352,18 @@ def compute_plan_for_code(
         return None
 
     # Align to signal_date (defensive; usually the latest row)
-    if signal_date not in set(df["date"].astype(str)):
+    dates = df["date"].astype(str)
+    if signal_date in set(dates):
+        i = int(df.index[dates == signal_date][0])
+    elif fallback_to_latest_before_signal_date:
+        candidates = df.index[dates <= str(signal_date)].tolist()
+        if not candidates:
+            return None
+        i = int(candidates[-1])
+        signal_date = str(df.iloc[i]["date"])
+    else:
         # if the code has missing latest date, skip
         return None
-    i = int(df.index[df["date"].astype(str) == signal_date][0])
     if i <= 0:
         return None
 
@@ -378,7 +388,7 @@ def compute_plan_for_code(
     trigger = (close < float(sma_fast[i])) and (float(rsi[i]) <= float(rsi_thresh))
     if use_trend_filter:
         trigger = trigger and (close > float(sma_trend[i]))
-    if not trigger:
+    if enforce_signal_trigger and not trigger:
         return None
 
     entry = close - entry_k * atr_v

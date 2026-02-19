@@ -511,6 +511,8 @@ def _sync_daytrade_plans_and_queue(
             rank=rank,
             signal_date=signal_date,
             daytrade_cfg=daytrade_cfg,
+            enforce_signal_trigger=False,
+            fallback_to_latest_before_signal_date=True,
         )
         if not plan:
             continue
