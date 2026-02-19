@@ -2105,11 +2105,70 @@ def _build_selection_summary(conn: sqlite3.Connection, settings: Dict[str, Any])
     if not final.empty:
         final["rank"] = range(1, len(final) + 1)
 
+    daytrade_cfg = load_daytrade_cfg(settings)
+    daytrade_enabled = bool(daytrade_cfg.get("enabled", False))
+    signal_date = latest_price_date(conn)
+    if not daytrade_enabled:
+        default_plan_status = "daytrade_disabled"
+    elif not signal_date:
+        default_plan_status = "no_price_data"
+    else:
+        default_plan_status = "wait"
+
+    def _empty_candidate_plan(status: str = default_plan_status) -> Dict[str, Any]:
+        return {
+            "status": status,
+            "signal_date": str(signal_date) if signal_date else None,
+            "entry_price": None,
+            "target_price": None,
+            "stop_price": None,
+        }
+
+    plan_by_code: Dict[str, Dict[str, Any]] = {}
+    if not final.empty:
+        for _, row in final.iterrows():
+            code = str(row.get("code") or "").strip().upper()
+            if not code:
+                continue
+            if not (daytrade_enabled and signal_date):
+                plan_by_code[code] = _empty_candidate_plan()
+                continue
+
+            try:
+                rank = int(row.get("rank") or 0)
+            except Exception:
+                rank = 0
+            try:
+                plan = compute_plan_for_code(
+                    conn,
+                    code=code,
+                    rank=max(1, int(rank)),
+                    signal_date=str(signal_date),
+                    daytrade_cfg=daytrade_cfg,
+                )
+            except Exception:
+                logging.exception("failed to compute selection candidate plan for %s", code)
+                plan = None
+
+            if plan:
+                plan_by_code[code] = {
+                    "status": "ready",
+                    "signal_date": str(plan.signal_date),
+                    "entry_price": round(float(plan.entry), 4),
+                    "target_price": round(float(plan.target), 4),
+                    "stop_price": round(float(plan.stop), 4),
+                }
+            else:
+                plan_by_code[code] = _empty_candidate_plan("wait")
+
     cols = ["code", "name", "market", "amount", "close", "disparity", "rank", "sector_name", "industry_name"]
     for c in cols:
         if c not in final.columns:
             final[c] = None
     candidates = final[cols].replace([np.inf, -np.inf], np.nan).fillna("").to_dict(orient="records")
+    for row in candidates:
+        code = str(row.get("code") or "").strip().upper()
+        row["plan"] = plan_by_code.get(code) or _empty_candidate_plan()
 
     def _items(df_stage: pd.DataFrame) -> List[Dict[str, Any]]:
         if df_stage.empty:

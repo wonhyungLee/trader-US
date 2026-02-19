@@ -1267,14 +1267,14 @@ body {
 
 .result-row {
   display: grid;
-  grid-template-columns: 70px 1.2fr 90px 120px 80px 90px;
+  grid-template-columns: 60px 90px 1.4fr 110px 90px 120px 120px 90px;
   gap: 8px;
   align-items: center;
   padding: 8px 10px;
   border-radius: 10px;
   background: rgba(15, 23, 42, 0.7);
   border: 1px solid var(--line);
-  min-width: 680px;
+  min-width: 920px;
 }
 
 .result-row.result-clickable {
@@ -1300,6 +1300,11 @@ body {
   font-size: 11px;
   color: var(--muted);
   z-index: 1;
+}
+
+.result-row .plan-buy,
+.result-row .plan-sell {
+  font-variant-numeric: tabular-nums;
 }
 
 .result-total {
@@ -1800,7 +1805,8 @@ body {
     grid-template-areas:
       "rank code market"
       "name name name"
-      "amount amount disparity";
+      "amount amount disparity"
+      "buy buy sell";
     row-gap: 4px;
     padding: 10px 12px;
   }
@@ -1839,6 +1845,29 @@ body {
     font-variant-numeric: tabular-nums;
   }
   .result-row span:nth-child(6) {
+    grid-area: buy;
+    color: rgba(226, 232, 240, 0.9);
+    font-variant-numeric: tabular-nums;
+  }
+  .result-row span:nth-child(6)::before {
+    content: "매수 ";
+    color: var(--muted);
+    font-size: 11px;
+    margin-right: 4px;
+  }
+  .result-row span:nth-child(7) {
+    grid-area: sell;
+    justify-self: end;
+    color: rgba(226, 232, 240, 0.9);
+    font-variant-numeric: tabular-nums;
+  }
+  .result-row span:nth-child(7)::before {
+    content: "매도 ";
+    color: var(--muted);
+    font-size: 11px;
+    margin-right: 4px;
+  }
+  .result-row span:nth-child(8) {
     grid-area: market;
     justify-self: end;
     align-self: center;

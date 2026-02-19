@@ -1045,6 +1045,8 @@ function App() {
                     <span>Name</span>
                     <span>Amount</span>
                     <span>Disparity</span>
+                    <span>매수 추천</span>
+                    <span>매도 추천</span>
                     <span>Market</span>
                   </div>
                   {finalCandidates.slice(0, 25).map((row, idx) => (
@@ -1067,6 +1069,12 @@ function App() {
                       <span>{formatCurrency(row.amount)}</span>
                       <span className={(row.disparity ?? 0) <= 0 ? 'down' : 'up'}>
                         {formatPct((row.disparity || 0) * 100)}
+                      </span>
+                      <span className="plan-buy">
+                        {formatCurrency(row?.plan?.entry_price)}
+                      </span>
+                      <span className="plan-sell">
+                        {formatCurrency(row?.plan?.target_price)}
                       </span>
                       <span>{row.market || '-'}</span>
                     </div>
