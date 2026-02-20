@@ -15,7 +15,7 @@ export const fetchSelectionFilters = () => api.get('/selection_filters').then(r 
 export const fetchStatus = () => api.get('/status').then(r => r.data);
 export const fetchStrategy = () => api.get('/strategy').then(r => r.data);
 export const fetchJobs = () => api.get('/jobs').then(r => r.data);
-export const fetchCoupangBanner = (params = {}) => api.get('/api/coupang-banner', { params }).then(r => r.data);
+export const fetchCoupangAdLinks = (params = {}) => api.get('/api/coupang-links', { params }).then(r => r.data);
 export const triggerExport = () => api.post('/export').then(r => r.data);
 export const updateSelectionFilterToggle = (key, enabled, password) =>
   api.post('/selection_filters/toggle', { key, enabled, password }).then(r => r.data);
@@ -30,8 +30,8 @@ export const fetchAutotradeRecommend = (code, params = {}) =>
 export const fetchAutotradeWatchlist = () =>
   api.get('/autotrade/watchlist').then(r => r.data);
 
-export const setAutotradeWatchlist = (code, list_type, enabled, password) =>
-  api.post('/autotrade/watchlist/set', { code, list_type, enabled, password }).then(r => r.data);
+export const setAutotradeWatchlist = (code, enabled, password) =>
+  api.post('/autotrade/watchlist/set', { code, list_type: 'SELECTED', enabled, password }).then(r => r.data);
 
 export const removeAutotradeWatchlist = (code, password) =>
   api.post('/autotrade/watchlist/remove', { code, password }).then(r => r.data);

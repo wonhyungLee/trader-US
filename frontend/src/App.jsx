@@ -347,13 +347,13 @@ function App() {
     return asArray(autotradeWatchlist).find((r) => String(r?.code || '').toUpperCase() === code) || null
   }, [autotradeWatchlist, selected])
 
-  const handleAutotradeSet = useCallback(async (listType) => {
+  const handleAutotradeSet = useCallback(async () => {
     if (!selected?.code) return
     const password = window.prompt('자동매매 비밀번호를 입력하세요')
     if (!password) return
     setAutotradeError('')
     try {
-      await setAutotradeWatchlist(selected.code, listType, true, password)
+      await setAutotradeWatchlist(selected.code, true, password)
       const wl = await fetchAutotradeWatchlist()
       setAutotradeWatchlistState(asArray(wl))
     } catch {
@@ -929,6 +929,7 @@ function App() {
               </div>
               <span className="section-meta">기준일 {selection?.date || '-'}</span>
             </div>
+            <CoupangBanner />
             {filterError ? <div className="error-banner">{filterError}</div> : null}
             <div className="flow-grid">
               {flowStages.map((stage) => (
@@ -1185,8 +1186,6 @@ function App() {
         </section>
       </main>
 
-      <CoupangBanner disabled={modalOpen} />
-
       <div className="mobile-actionbar" aria-label="모바일 빠른 메뉴">
         <button
           type="button"
@@ -1281,12 +1280,12 @@ function App() {
                 </div>
               </div>
               <div className="chart-card autotrade-card">
-                <div className="chart-title">Auto Trade Engine</div>
+                <div className="chart-title">Daytrade Engine</div>
                 <div className="autotrade-meta">
                   <span>기준일 {autotradeRec?.snapshot?.date || '-'}</span>
                   <span>상태 {autotradeRec?.status || '-'}</span>
                   <span>신뢰 {Number.isFinite(Number(autotradeRec?.confidence)) ? `${Number(autotradeRec.confidence).toFixed(1)}%` : '-'}</span>
-                  <span>목록 {selectedAutotrade ? `${selectedAutotrade.list_type} · ${selectedAutotrade.enabled ? 'ON' : 'OFF'}` : 'OFF'}</span>
+                  <span>목록 {selectedAutotrade?.enabled ? 'ON' : 'OFF'}</span>
                 </div>
                 {autotradeRecLoading ? (
                   <div className="empty">엔진 계산 중...</div>
@@ -1309,11 +1308,8 @@ function App() {
                   <div className="empty">엔진 결과가 없습니다.</div>
                 )}
                 <div className="autotrade-actions">
-                  <button className="autotrade-btn" onClick={() => handleAutotradeSet('SELECTED')}>
+                  <button className="autotrade-btn" onClick={handleAutotradeSet}>
                     선정목록(매수)
-                  </button>
-                  <button className="autotrade-btn" onClick={() => handleAutotradeSet('EXIT')}>
-                    이탈목록(매도)
                   </button>
                   <button className="autotrade-btn danger" onClick={handleAutotradeRemove} disabled={!selectedAutotrade}>
                     해제

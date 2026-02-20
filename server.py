@@ -8,12 +8,13 @@ import time
 import threading
 import subprocess
 import sys
-import hmac
 import hashlib
-import random
+import re
+import html
 from datetime import datetime, date
 from pathlib import Path
 from typing import Any, Dict, Tuple, Optional, List
+from urllib.parse import urljoin, quote
 
 import numpy as np
 import pandas as pd
@@ -22,11 +23,16 @@ from flask import Flask, jsonify, request, send_from_directory, abort
 from flask_cors import CORS
 
 from src.analyzer.backtest_runner import load_strategy
+from src.daytrade.planner import (
+    build_traderus_selection,
+    compute_plan_for_code,
+    load_daytrade_cfg,
+    latest_price_date,
+)
 from src.storage.sqlite_store import SQLiteStore, normalize_code
 from src.utils.config import load_settings, list_kis_key_inventory, set_kis_key_enabled
 from src.utils.db_exporter import maybe_export_db
 from src.utils.project_root import ensure_repo_root
-from src.autotrade.engine_adapter import recommend_daytrade_plan
 
 ensure_repo_root(Path(__file__).resolve().parent)
 
@@ -51,9 +57,7 @@ FILTER_TOGGLE_KEYS = ("min_amount", "liquidity", "disparity")
 _store = SQLiteStore(str(DB_PATH))
 _store.conn.close()
 
-AUTOTRADE_CFG = SETTINGS.get("autotrade", {}) or {}
 LIST_SELECTED = "SELECTED"
-LIST_EXIT = "EXIT"
 
 _balance_cache: Dict[str, Any] = {"ts": 0.0, "data": None}
 _selection_cache: Dict[str, Any] = {"ts": 0.0, "data": None}
@@ -69,15 +73,16 @@ CURRENT_PRICE_CACHE_TTL_SEC = float(os.getenv("CURRENT_PRICE_CACHE_TTL_SEC", "55
 _current_price_cache: Dict[str, Dict[str, Any]] = {}
 _current_price_lock = threading.Lock()
 
-_coupang_banner_cache: Dict[str, Any] = {"ts": 0.0, "payload": None}
-COUPANG_BANNER_CACHE_TTL_SEC = float(os.getenv("COUPANG_BANNER_CACHE_TTL_SEC", "1800"))
-COUPANG_INFO_PATHS = [
-    Path(os.getenv("COUPANG_INFO_PATH", "")).expanduser() if os.getenv("COUPANG_INFO_PATH") else None,
-    Path("/home/ubuntu/쿠팡파트너스api정보.txt"),
-    Path("/home/ubuntu/쿠팡파트너스 api정보.txt"),
-    Path("쿠팡파트너스api정보.txt"),
-    Path("쿠팡파트너스 api정보.txt"),
+COUPANG_LINK_PATHS = [
+    Path(os.getenv("COUPANG_LINK_PATH", "")).expanduser() if os.getenv("COUPANG_LINK_PATH") else None,
+    Path("/home/ubuntu/쿠팡광고링크.txt"),
+    Path("쿠팡광고링크.txt"),
 ]
+_coupang_link_cache: Dict[str, Any] = {"path": None, "mtime": 0.0, "links": []}
+COUPANG_OG_CACHE_TTL_SEC = float(os.getenv("COUPANG_OG_CACHE_TTL_SEC", "86400"))
+COUPANG_OG_HTTP_TIMEOUT_SEC = float(os.getenv("COUPANG_OG_HTTP_TIMEOUT_SEC", "8"))
+_coupang_og_cache: Dict[str, Dict[str, Any]] = {}
+_coupang_og_lock = threading.Lock()
 
 _watchdog_enabled_default = bool(WATCHDOG_CFG.get("enabled", True))
 DB_WATCHDOG_ENABLED = os.getenv("BNF_DB_WATCHDOG_ENABLED", str(int(_watchdog_enabled_default))).strip().lower() not in {"0", "false", "no"}
@@ -299,120 +304,163 @@ def _kis_ready(settings: Dict[str, Any]) -> bool:
     return True
 
 
-def _extract_value_after_label(lines: List[str], labels: List[str]) -> Optional[str]:
-    lowered = [l.strip().lower() for l in labels if l and str(l).strip()]
-    for i, raw in enumerate(lines):
-        line = str(raw or "").strip()
-        if not line:
+def _extract_coupang_links(text: str) -> List[str]:
+    links: List[str] = []
+    seen: set[str] = set()
+    for raw in re.findall(r"https?://link\.coupang\.com/[^\s<>\"]+", text or "", flags=re.IGNORECASE):
+        link = str(raw).strip().strip("()[]{}|,")
+        if not link or link in seen:
             continue
-        low = line.lower()
-        if any(low == lab or low.startswith(lab) for lab in lowered):
-            for j in range(i + 1, min(len(lines), i + 10)):
-                candidate = str(lines[j] or "").strip()
-                if candidate:
-                    return candidate
-    return None
+        seen.add(link)
+        links.append(link)
+    return links
 
 
-def _load_coupang_credentials() -> Optional[Dict[str, str]]:
-    access = os.getenv("COUPANG_ACCESS_KEY", "").strip()
-    secret = os.getenv("COUPANG_SECRET_KEY", "").strip()
-    partner_id = os.getenv("COUPANG_PARTNER_ID", "").strip()
-    sub_id = os.getenv("COUPANG_SUB_ID", "").strip() or "trader-us-banner"
-    if access and secret:
-        out = {"access_key": access, "secret_key": secret, "sub_id": sub_id}
-        if partner_id:
-            out["partner_id"] = partner_id
-        return out
-
-    for path in COUPANG_INFO_PATHS:
+def _load_coupang_ad_links() -> Tuple[List[str], Optional[str]]:
+    for path in COUPANG_LINK_PATHS:
         if not path:
             continue
         try:
             if not path.exists():
                 continue
+            stat = path.stat()
+            mtime = float(stat.st_mtime)
+            cache_path = _coupang_link_cache.get("path")
+            cache_mtime = float(_coupang_link_cache.get("mtime") or 0.0)
+            if cache_path == str(path) and cache_mtime == mtime:
+                cached_links = _coupang_link_cache.get("links")
+                if isinstance(cached_links, list):
+                    return [str(x) for x in cached_links if x], str(path.name)
+
             text = path.read_text(encoding="utf-8", errors="ignore")
+            links = _extract_coupang_links(text)
+            _coupang_link_cache.update({"path": str(path), "mtime": mtime, "links": links})
+            return links, str(path.name)
         except Exception:
             continue
-        lines = text.splitlines()
-        access_key = _extract_value_after_label(lines, ["access key", "access_key", "access-key"])
-        secret_key = _extract_value_after_label(lines, ["secret key", "secret_key", "secret-key"])
-        parsed_partner_id = _extract_value_after_label(lines, ["id", "partner id", "partner_id"])
-        if access_key and secret_key:
-            out = {"access_key": access_key, "secret_key": secret_key, "sub_id": sub_id}
-            if parsed_partner_id and parsed_partner_id.upper().startswith("AF"):
-                out["partner_id"] = parsed_partner_id
-            return out
 
-    return None
+    return [], None
 
 
-def _coupang_signed_date(now: Optional[datetime] = None) -> str:
-    dt = now or datetime.utcnow()
-    return dt.strftime("%y%m%dT%H%M%SZ")
+def _normalize_meta_text(value: Any) -> str:
+    text = html.unescape(str(value or ""))
+    text = re.sub(r"<[^>]+>", " ", text)
+    text = re.sub(r"\s+", " ", text).strip()
+    return text
 
 
-def _coupang_hmac_signature(secret_key: str, message: str) -> str:
-    digest = hmac.new(secret_key.encode("utf-8"), message.encode("utf-8"), hashlib.sha256).hexdigest()
-    return digest
-
-
-def _fetch_coupang_search_products_with_keys(access_key: str, secret_key: str, keyword: str, limit: int, sub_id: str) -> List[Dict[str, Any]]:
-    access_key = str(access_key or "").strip()
-    secret_key = str(secret_key or "").strip()
-    if not access_key or not secret_key:
-        raise RuntimeError("coupang_credentials_missing")
-
-    path = "/v2/providers/affiliate_open_api/apis/openapi/v1/products/search"
-    # Keep query ordering stable for signature correctness.
-    keyword_enc = requests.utils.quote(str(keyword), safe="")
-    query = f"keyword={keyword_enc}&limit={int(limit)}&subId={requests.utils.quote(str(sub_id), safe='')}"
-
-    signed_date = _coupang_signed_date()
-    message = f"{signed_date}GET{path}{query}"
-    signature = _coupang_hmac_signature(secret_key, message)
-    authorization = (
-        "CEA algorithm=HmacSHA256, "
-        f"access-key={access_key}, "
-        f"signed-date={signed_date}, "
-        f"signature={signature}"
-    )
-
-    url = f"https://api-gateway.coupang.com{path}?{query}"
-    resp = requests.get(url, headers={"Authorization": authorization}, timeout=10)
-    if not resp.ok:
-        raise RuntimeError(f"coupang_api_error status={resp.status_code}")
-    data = resp.json() if resp.content else {}
-    if isinstance(data, dict):
-        rcode = str(data.get("rCode") or "")
-        if rcode and rcode != "0":
-            raise RuntimeError(f"coupang_api_error rCode={rcode}")
-        payload = data.get("data") or {}
-        products = payload.get("productData") or []
-        if isinstance(products, list):
-            return [p for p in products if isinstance(p, dict)]
-    return []
-
-
-def _fetch_coupang_search_products(keyword: str, limit: int, sub_id: str) -> List[Dict[str, Any]]:
-    creds = _load_coupang_credentials()
-    if not creds:
-        raise RuntimeError("coupang_credentials_missing")
-    return _fetch_coupang_search_products_with_keys(
-        access_key=creds["access_key"],
-        secret_key=creds["secret_key"],
-        keyword=keyword,
-        limit=limit,
-        sub_id=sub_id,
-    )
-
-
-def _format_price_krw(value: Any) -> str:
-    try:
-        num = int(float(str(value).replace(",", "").strip()))
-        return f"{num:,}원"
-    except Exception:
+def _extract_meta_content(html_text: str, keys: List[str]) -> str:
+    if not html_text:
         return ""
+    for key in keys:
+        key_pattern = re.escape(str(key))
+        patterns = [
+            rf'<meta[^>]+(?:property|name)\s*=\s*["\']{key_pattern}["\'][^>]*content\s*=\s*["\']([^"\']+)["\'][^>]*>',
+            rf'<meta[^>]+content\s*=\s*["\']([^"\']+)["\'][^>]*(?:property|name)\s*=\s*["\']{key_pattern}["\'][^>]*>',
+        ]
+        for pattern in patterns:
+            match = re.search(pattern, html_text, flags=re.IGNORECASE)
+            if match:
+                return _normalize_meta_text(match.group(1))
+    return ""
+
+
+def _fetch_coupang_og_metadata(link: str) -> Dict[str, str]:
+    url = str(link or "").strip()
+    if not url:
+        return {"title": "", "image": "", "description": ""}
+
+    now = time.time()
+    with _coupang_og_lock:
+        cached = _coupang_og_cache.get(url) or {}
+        cached_ts = float(cached.get("ts") or 0.0)
+        if (now - cached_ts) < COUPANG_OG_CACHE_TTL_SEC:
+            meta = cached.get("meta")
+            if isinstance(meta, dict):
+                return {
+                    "title": str(meta.get("title") or ""),
+                    "image": str(meta.get("image") or ""),
+                    "description": str(meta.get("description") or ""),
+                }
+
+    result = {"title": "", "image": "", "description": ""}
+    final_url = url
+    try:
+        resp = requests.get(
+            url,
+            allow_redirects=True,
+            timeout=(4, COUPANG_OG_HTTP_TIMEOUT_SEC),
+            headers={
+                "User-Agent": "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0 Safari/537.36",
+                "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+            },
+        )
+        final_url = str(resp.url or url)
+        if resp.ok and isinstance(resp.text, str) and resp.text:
+            html_text = resp.text[:350000]
+            title = _extract_meta_content(html_text, ["og:title", "twitter:title"])
+            if not title:
+                title_match = re.search(r"<title[^>]*>(.*?)</title>", html_text, flags=re.IGNORECASE | re.DOTALL)
+                if title_match:
+                    title = _normalize_meta_text(title_match.group(1))
+
+            image_url = _extract_meta_content(
+                html_text,
+                ["og:image", "og:image:url", "twitter:image", "twitter:image:src"],
+            )
+            if image_url:
+                image_url = urljoin(final_url, image_url)
+            else:
+                # Coupang short links can block direct crawling from servers.
+                # Fallback to GitHub open graph renderer for a preview image.
+                image_url = f"https://opengraph.githubassets.com/1/{quote(url, safe='')}"
+
+            description = _extract_meta_content(
+                html_text,
+                ["og:description", "twitter:description", "description"],
+            )
+            result = {
+                "title": title,
+                "image": image_url,
+                "description": description,
+            }
+    except Exception as exc:
+        logging.debug("[coupang] og fetch failed link=%s err=%s", url, exc)
+
+    if not result.get("image"):
+        result["image"] = f"https://opengraph.githubassets.com/1/{quote(url, safe='')}"
+
+    with _coupang_og_lock:
+        _coupang_og_cache[url] = {"ts": now, "meta": result}
+    return result
+
+
+def _build_coupang_link_payload(limit: int) -> Dict[str, Any]:
+    resolved_limit = max(1, min(12, int(limit)))
+    links, source = _load_coupang_ad_links()
+    ordered_links = links
+    if links:
+        bucket = int(time.time() // 3600)
+        start = bucket % len(links)
+        ordered_links = links[start:] + links[:start]
+
+    items: List[Dict[str, Any]] = []
+    for idx, link in enumerate(ordered_links[:resolved_limit]):
+        og = _fetch_coupang_og_metadata(link)
+        items.append({
+            "title": str(og.get("title") or f"쿠팡 추천 {idx + 1}"),
+            "link": link,
+            "cta": "바로가기",
+            "image": str(og.get("image") or ""),
+            "meta": str(og.get("description") or ""),
+        })
+
+    return {
+        "items": items,
+        "total": len(links),
+        "source": source or "쿠팡광고링크.txt",
+        "disclosure": "이 포스팅은 쿠팡파트너스 활동의 일환으로, 이에 따른 일정액의 수수료를 제공받을 수 있습니다.",
+    }
 
 
 def _latest_price_map(conn: sqlite3.Connection, codes: List[str]) -> Dict[str, Dict[str, Any]]:
@@ -1000,155 +1048,34 @@ if cors_origins:
     if origins:
         CORS(app, resources={r"/*": {"origins": origins}})
 
-DAILY_NECESSITIES_KEYWORDS = [
-    "화장지",
-    "물티슈",
-    "키친타올",
-    "주방세제",
-    "세탁세제",
-    "섬유유연제",
-    "샴푸",
-    "린스",
-    "바디워시",
-    "치약",
-    "칫솔",
-    "비누",
-    "생수",
-    "라면",
-    "즉석밥",
-    "쓰레기봉투",
-    "고무장갑",
-    "주방장갑",
-    "위생장갑",
-    "손소독제",
-]
-
-
 @app.get("/api/coupang-banner")
 def coupang_banner():
-    """Return a small set of Coupang Partners products for the site banner."""
-    keyword_override = str(request.args.get("keyword") or "").strip()
+    """Backward-compatible endpoint. Uses local coupang links file only."""
     limit_raw = request.args.get("limit")
     try:
         limit = int(limit_raw) if limit_raw is not None else 1
     except Exception:
         limit = 1
-    limit = max(1, min(3, limit))
-
-    now = time.time()
-    if not keyword_override:
-        cached_payload = _coupang_banner_cache.get("payload")
-        cached_ts = float(_coupang_banner_cache.get("ts") or 0.0)
-        if cached_payload and (now - cached_ts) < COUPANG_BANNER_CACHE_TTL_SEC:
-            return jsonify(cached_payload)
-
-    creds = _load_coupang_credentials()
-    if not creds:
-        return jsonify({
-            "keyword": keyword_override,
-            "theme": {"id": "necessities", "title": "생필품 추천", "tagline": "오늘 필요한 생활 필수템", "cta": "쿠팡에서 보기"},
-            "items": [],
-            "error": "credentials_missing",
-        })
-
-    sub_id = creds.get("sub_id") or "trader-us-banner"
-    access_key = creds.get("access_key") or ""
-    secret_key = creds.get("secret_key") or ""
-    if keyword_override:
-        keyword = keyword_override
-    else:
-        # Make it stable per cache TTL bucket to reduce API calls under traffic bursts.
-        bucket = int(now // max(COUPANG_BANNER_CACHE_TTL_SEC, 1))
-        rng = random.Random(bucket)
-        keyword = rng.choice(DAILY_NECESSITIES_KEYWORDS)
-
-    try:
-        products = _fetch_coupang_search_products_with_keys(
-            access_key=access_key,
-            secret_key=secret_key,
-            keyword=keyword,
-            limit=limit,
-            sub_id=sub_id,
-        )
-    except Exception as exc:
-        logging.warning("[coupang] banner fetch failed: %s", exc)
-        return jsonify({
-            "keyword": keyword,
-            "theme": {"id": "necessities", "title": "생필품 추천", "tagline": "오늘 필요한 생활 필수템", "cta": "쿠팡에서 보기"},
-            "items": [],
-            "error": "fetch_failed",
-        })
-
-    items: List[Dict[str, Any]] = []
-    ctas = ["최저가 보기", "쿠팡에서 보기", "리뷰 보고 선택"]
-    for idx, product in enumerate(products[:limit]):
-        title = str(product.get("productName") or "").strip()
-        image = str(product.get("productImage") or "").strip()
-        link = str(product.get("productUrl") or "").strip()
-        if not title or not link:
-            continue
-
-        discount = None
-        try:
-            rate = float(product.get("productDiscountRate") or 0)
-            if rate > 0:
-                discount = int(round(rate))
-        except Exception:
-            discount = None
-
-        rocket = bool(
-            product.get("rocketWow")
-            or product.get("rocket")
-            or str(product.get("rocketDeliveryType") or "").upper() == "ROCKET"
-            or product.get("isRocket")
-            or product.get("isRocketWow")
-        )
-        free_shipping = bool(product.get("isFreeShipping") or product.get("freeShipping"))
-        shipping_tag = "로켓배송" if rocket else ("무료배송" if free_shipping else "")
-
-        rating_count = None
-        rating = None
-        try:
-            rating_count = int(product.get("ratingCount") or product.get("reviewCount") or 0) or None
-        except Exception:
-            rating_count = None
-        try:
-            rating = float(product.get("rating") or product.get("ratingAverage") or product.get("ratingScore") or 0) or None
-        except Exception:
-            rating = None
-
-        meta_parts: List[str] = []
-        if isinstance(rating, (int, float)) and rating and rating > 0:
-            meta_parts.append(f"★{rating:.1f}")
-        if rating_count:
-            meta_parts.append(f"리뷰 {rating_count:,}개")
-        if shipping_tag:
-            meta_parts.append(shipping_tag)
-        category_name = str(product.get("categoryName") or "").strip()
-        if category_name:
-            meta_parts.append(category_name)
-
-        items.append({
-            "title": title,
-            "image": image,
-            "link": link,
-            "price": _format_price_krw(product.get("productPrice")),
-            "meta": " · ".join([m for m in meta_parts if m]),
-            "badge": "생활필수품",
-            "discountRate": discount,
-            "cta": ctas[idx % len(ctas)],
-            "shippingTag": shipping_tag,
-            "ratingCount": rating_count,
-            "rating": rating,
-        })
-
-    payload = {
-        "keyword": keyword,
-        "theme": {"id": "necessities", "title": "생필품 추천", "tagline": "오늘 필요한 생활 필수템", "cta": "쿠팡에서 보기"},
-        "items": items,
+    payload = _build_coupang_link_payload(limit=max(1, min(12, limit)))
+    payload["theme"] = {
+        "id": "coupang_links",
+        "title": "쿠팡 추천 링크",
+        "tagline": "쿠팡광고링크.txt 기반 광고",
+        "cta": "쿠팡에서 보기",
     }
-    if not keyword_override:
-        _coupang_banner_cache.update({"ts": now, "payload": payload})
+    payload["keyword"] = "local-links-only"
+    return jsonify(payload)
+
+
+@app.get("/api/coupang-links")
+def coupang_links():
+    """Return curated Coupang partner links from local text file."""
+    limit_raw = request.args.get("limit")
+    try:
+        limit = int(limit_raw) if limit_raw is not None else 4
+    except Exception:
+        limit = 4
+    payload = _build_coupang_link_payload(limit=max(1, min(12, limit)))
     return jsonify(payload)
 
 
@@ -1357,62 +1284,96 @@ def portfolio():
 @app.get("/plans")
 def plans():
     conn = get_conn()
-    exec_date = request.args.get("exec_date")
-    if not exec_date:
-        try:
-            exec_date = conn.execute("SELECT MAX(exec_date) FROM order_queue").fetchone()[0]
-        except Exception:
-            exec_date = None
-    if not exec_date:
-        return jsonify({"exec_date": None, "buys": [], "sells": []})
-
     try:
+        # Keep backward-compatible query param name (`exec_date`) while switching
+        # the data source to daytrade autotrade_queue (asof_date).
+        exec_date = request.args.get("exec_date") or request.args.get("asof_date")
+        if not exec_date:
+            row = conn.execute("SELECT MAX(asof_date) FROM autotrade_queue").fetchone()
+            exec_date = row[0] if row and row[0] else None
+        if not exec_date:
+            return jsonify({"exec_date": None, "buys": [], "sells": [], "counts": {"buys": 0, "sells": 0}})
+
         df = pd.read_sql_query(
             """
-            SELECT o.id, o.signal_date, o.exec_date, o.code, o.side, o.qty, o.rank, o.status,
-                   o.ord_dvsn, o.ord_unpr, o.stop_unpr, o.target_unpr, o.strategy, o.meta_json,
-                   o.created_at, o.updated_at,
-                   u.name, u.market, s.sector_name, s.industry_name
-            FROM order_queue o
-            LEFT JOIN universe_members u ON o.code = u.code
-            LEFT JOIN sector_map s ON o.code = s.code
-            WHERE o.exec_date = ? AND o.status IN ('PENDING','SENT','PARTIAL','NOT_FOUND')
-            ORDER BY o.rank ASC, o.id ASC
+            SELECT q.id,
+                   q.asof_date AS signal_date,
+                   q.asof_date AS exec_date,
+                   q.code,
+                   q.side,
+                   q.status,
+                   q.trigger_price AS ord_unpr,
+                   q.payload_json,
+                   p.stop_price AS stop_unpr,
+                   p.target_price AS target_unpr,
+                   p.plan_json AS meta_json,
+                   q.created_at,
+                   q.updated_at,
+                   u.name,
+                   u.market,
+                   s.sector_name,
+                   s.industry_name
+            FROM autotrade_queue q
+            LEFT JOIN autotrade_plans p
+              ON p.asof_date = q.asof_date AND p.code = q.code
+            LEFT JOIN universe_members u ON q.code = u.code
+            LEFT JOIN sector_map s ON q.code = s.code
+            WHERE q.asof_date = ? AND q.status IN ('PENDING', 'SENDING', 'SENT', 'ERROR', 'SKIPPED')
+            ORDER BY q.id ASC
             """,
             conn,
             params=(exec_date,),
         )
-    except Exception:
-        return jsonify({"exec_date": exec_date, "buys": [], "sells": [], "counts": {"buys": 0, "sells": 0}})
+        codes = df["code"].dropna().astype(str).unique().tolist() if not df.empty else []
+        price_map = _latest_price_map(conn, codes)
 
-    codes = df["code"].dropna().astype(str).unique().tolist() if not df.empty else []
-    price_map = _latest_price_map(conn, codes)
-    buys = []
-    sells = []
-    for row in df.to_dict(orient="records"):
-        code = row.get("code")
-        last = price_map.get(code, {})
-        planned_price = row.get("ord_unpr") if row.get("ord_unpr") else last.get("close")
-        row.update(
+        buys: List[Dict[str, Any]] = []
+        sells: List[Dict[str, Any]] = []
+        for idx, row in enumerate(df.to_dict(orient="records"), start=1):
+            payload = {}
+            try:
+                payload_raw = row.get("payload_json")
+                payload = json.loads(payload_raw) if payload_raw else {}
+            except Exception:
+                payload = {}
+            qty = int(payload.get("amount") or 0) if isinstance(payload, dict) else 0
+            ord_dvsn = str(payload.get("orderType") or "") if isinstance(payload, dict) else ""
+
+            code = row.get("code")
+            last = price_map.get(code, {})
+            planned_price = row.get("ord_unpr") if row.get("ord_unpr") else last.get("close")
+            row.update(
+                {
+                    "qty": qty,
+                    "rank": idx,
+                    "ord_dvsn": ord_dvsn,
+                    "strategy": "DAYTRADE_BALANCED",
+                    "planned_price": planned_price,
+                    "last_close": last.get("close"),
+                    "last_date": last.get("date"),
+                }
+            )
+            if row.get("side") == "SELL":
+                sells.append(row)
+            else:
+                buys.append(row)
+
+        return jsonify(
             {
-                "planned_price": planned_price,
-                "last_close": last.get("close"),
-                "last_date": last.get("date"),
+                "exec_date": exec_date,
+                "buys": buys,
+                "sells": sells,
+                "counts": {"buys": len(buys), "sells": len(sells)},
             }
         )
-        if row.get("side") == "SELL":
-            sells.append(row)
-        else:
-            buys.append(row)
-
-    return jsonify(
-        {
-            "exec_date": exec_date,
-            "buys": buys,
-            "sells": sells,
-            "counts": {"buys": len(buys), "sells": len(sells)},
-        }
-    )
+    except Exception:
+        logging.exception("failed to load plans for %s", exec_date if 'exec_date' in locals() else None)
+        return jsonify({"exec_date": request.args.get("exec_date"), "buys": [], "sells": [], "counts": {"buys": 0, "sells": 0}})
+    finally:
+        try:
+            conn.close()
+        except Exception:
+            pass
 
 
 @app.get("/account")
@@ -2252,94 +2213,122 @@ def selection_filters_toggle():
     return jsonify(_save_filter_toggles(toggles))
 
 
-def _autotrade_optimize_default() -> bool:
-    try:
-        return bool(AUTOTRADE_CFG.get("optimize", True))
-    except Exception:
-        return True
-
-
-def _autotrade_lookback_default() -> Optional[int]:
-    try:
-        v = AUTOTRADE_CFG.get("optimize_lookback_bars")
-        return int(v) if v is not None else None
-    except Exception:
-        return None
-
-
 @app.get("/autotrade/recommend")
 def autotrade_recommend():
-    """Return next-day entry/stop/target from stock_daytrade_engine (daily bars)."""
+    """Return daytrade plan aligned with autotrade worker logic."""
     code = str(request.args.get("code") or "").strip().upper()
     if not code:
         return jsonify({"ok": False, "error": "code is required"}), 400
 
-    optimize_raw = request.args.get("optimize")
-    if optimize_raw is None:
-        optimize = _autotrade_optimize_default()
-    else:
-        optimize = str(optimize_raw).strip().lower() not in {"0", "false", "no"}
+    code = normalize_code(code)
+    conn = get_conn()
+    try:
+        settings = load_settings()
+        daytrade_cfg = load_daytrade_cfg(settings)
+        if not bool(daytrade_cfg.get("enabled", False)):
+            return jsonify({"ok": False, "code": code, "error": "daytrade_disabled"})
 
-    lookback_raw = request.args.get("lookback")
-    lookback = _autotrade_lookback_default()
-    if lookback_raw is not None:
-        try:
-            lookback = int(lookback_raw)
-        except Exception:
-            lookback = lookback
+        signal_date = latest_price_date(conn)
+        if not signal_date:
+            return jsonify({"ok": False, "code": code, "error": "no_price_data"})
 
-    rec = recommend_daytrade_plan(
-        db_path=str(DB_PATH),
-        code=code,
-        optimize=bool(optimize),
-        optimize_lookback_bars=lookback,
-    )
+        latest_sel_date, sel_df = build_traderus_selection(conn, settings)
+        rank: Optional[int] = None
+        if not sel_df.empty and "code" in sel_df.columns:
+            hit = sel_df[sel_df["code"].astype(str).str.upper() == code]
+            if not hit.empty:
+                try:
+                    rank = int(hit.iloc[0].get("rank") or 0)
+                except Exception:
+                    rank = 0
 
-    if rec.get("ok"):
-        snap = rec.get("snapshot") or {}
-        plan = rec.get("plan") or {}
-        asof_date = str(snap.get("date") or "")
-        try:
-            conn = get_conn()
-            now = datetime.utcnow().isoformat()
-            conn.execute(
-                """
-                INSERT INTO autotrade_plans(
-                    asof_date, code, entry_price, target_price, stop_price, confidence, status, plan_json, created_at, updated_at
-                ) VALUES(?,?,?,?,?,?,?,?,?,?)
-                ON CONFLICT(asof_date, code) DO UPDATE SET
-                    entry_price=excluded.entry_price,
-                    target_price=excluded.target_price,
-                    stop_price=excluded.stop_price,
-                    confidence=excluded.confidence,
-                    status=excluded.status,
-                    plan_json=excluded.plan_json,
-                    updated_at=excluded.updated_at;
-                """,
-                (
-                    asof_date,
-                    normalize_code(code),
-                    _safe_float(plan.get("entry_price")),
-                    _safe_float(plan.get("target_price")),
-                    _safe_float(plan.get("stop_price")),
-                    _safe_float(rec.get("confidence")),
-                    str(rec.get("status") or ""),
-                    json.dumps(rec, ensure_ascii=False, default=str),
-                    now,
-                    now,
-                ),
+        rec: Dict[str, Any] = {
+            "ok": True,
+            "code": code,
+            "status": "wait",
+            "confidence": None,
+            "signal_date": str(signal_date),
+            "snapshot": {"date": str(signal_date)},
+            "plan": None,
+            "reason": "not_in_selection" if rank is None else "trigger_not_met",
+        }
+        if latest_sel_date:
+            rec["selection_date"] = str(latest_sel_date)
+
+        if rank is not None:
+            plan = compute_plan_for_code(
+                conn,
+                code=code,
+                rank=max(1, int(rank)),
+                signal_date=str(signal_date),
+                daytrade_cfg=daytrade_cfg,
             )
-            conn.commit()
-        except Exception:
-            # Recommendation should still return; DB write is best-effort.
-            logging.exception("failed to upsert autotrade plan for %s", code)
-        finally:
-            try:
-                conn.close()
-            except Exception:
-                pass
+            if plan:
+                rec["status"] = "ready"
+                rec["reason"] = "triggered"
+                rec["snapshot"] = {
+                    "date": str(plan.signal_date),
+                    "close": float(plan.close),
+                    "sma_fast": float(plan.sma_fast),
+                    "rsi": float(plan.rsi),
+                    "atr": float(plan.atr),
+                    "atr_pct": float(plan.atr_pct),
+                    "rank": int(plan.rank),
+                }
+                rec["plan"] = {
+                    "entry_price": round(float(plan.entry), 4),
+                    "target_price": round(float(plan.target), 4),
+                    "stop_price": round(float(plan.stop), 4),
+                    "exit_rule": "익절/손절 미체결 시 당일 종가 청산(EOD)",
+                    "both_hit_rule": str((daytrade_cfg.get("bracket") or {}).get("both_hit_rule", "stop_first")),
+                }
+            else:
+                row = conn.execute(
+                    "SELECT close FROM daily_price WHERE code=? AND date=?",
+                    (code, str(signal_date)),
+                ).fetchone()
+                if row and row[0] is not None:
+                    rec["snapshot"]["close"] = _safe_float(row[0])
 
-    return jsonify(rec)
+        now = datetime.utcnow().isoformat()
+        plan_data = rec.get("plan") or {}
+        conn.execute(
+            """
+            INSERT INTO autotrade_plans(
+                asof_date, code, entry_price, target_price, stop_price, confidence, status, plan_json, created_at, updated_at
+            ) VALUES(?,?,?,?,?,?,?,?,?,?)
+            ON CONFLICT(asof_date, code) DO UPDATE SET
+                entry_price=excluded.entry_price,
+                target_price=excluded.target_price,
+                stop_price=excluded.stop_price,
+                confidence=excluded.confidence,
+                status=excluded.status,
+                plan_json=excluded.plan_json,
+                updated_at=excluded.updated_at;
+            """,
+            (
+                str(signal_date),
+                code,
+                _safe_float(plan_data.get("entry_price")),
+                _safe_float(plan_data.get("target_price")),
+                _safe_float(plan_data.get("stop_price")),
+                None,
+                str(rec.get("status") or "wait").upper(),
+                json.dumps(rec, ensure_ascii=False, default=str),
+                now,
+                now,
+            ),
+        )
+        conn.commit()
+        return jsonify(rec)
+    except Exception:
+        logging.exception("failed to build daytrade recommendation for %s", code)
+        return jsonify({"ok": False, "code": code, "error": "recommendation_failed"}), 500
+    finally:
+        try:
+            conn.close()
+        except Exception:
+            pass
 
 
 @app.get("/autotrade/watchlist")
@@ -2371,12 +2360,13 @@ def autotrade_watchlist_set():
         return jsonify({"error": "invalid password"}), 403
 
     code = normalize_code(payload.get("code"))
-    list_type = str(payload.get("list_type") or LIST_SELECTED).strip().upper()
+    requested_list_type = str(payload.get("list_type") or LIST_SELECTED).strip().upper()
     enabled = bool(payload.get("enabled", True))
     if not code:
         return jsonify({"error": "code required"}), 400
-    if list_type not in {LIST_SELECTED, LIST_EXIT}:
-        return jsonify({"error": "invalid list_type"}), 400
+    if requested_list_type and requested_list_type != LIST_SELECTED:
+        return jsonify({"error": "only SELECTED is supported (daytrade-only mode)"}), 400
+    list_type = LIST_SELECTED
 
     conn = get_conn()
     try:
