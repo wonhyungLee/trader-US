@@ -12,7 +12,7 @@ import {
   setAutotradeWatchlist,
   removeAutotradeWatchlist
 } from './api'
-import CoupangBanner from './CoupangBanner'
+import CoupangAutoPopup from './CoupangAutoPopup'
 import {
   ResponsiveContainer,
   ComposedChart,
@@ -929,7 +929,6 @@ function App() {
               </div>
               <span className="section-meta">기준일 {selection?.date || '-'}</span>
             </div>
-            <CoupangBanner />
             {filterError ? <div className="error-banner">{filterError}</div> : null}
             <div className="flow-grid">
               {flowStages.map((stage) => (
@@ -1185,6 +1184,8 @@ function App() {
           </section>
         </section>
       </main>
+
+      <CoupangAutoPopup disabled={modalOpen} />
 
       <div className="mobile-actionbar" aria-label="모바일 빠른 메뉴">
         <button

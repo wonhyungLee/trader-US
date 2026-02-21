@@ -15,6 +15,7 @@ export const fetchSelectionFilters = () => api.get('/selection_filters').then(r 
 export const fetchStatus = () => api.get('/status').then(r => r.data);
 export const fetchStrategy = () => api.get('/strategy').then(r => r.data);
 export const fetchJobs = () => api.get('/jobs').then(r => r.data);
+export const fetchCoupangBanner = (params = {}) => api.get('/api/coupang-banner', { params }).then(r => r.data);
 export const fetchCoupangAdLinks = (params = {}) => api.get('/api/coupang-links', { params }).then(r => r.data);
 export const triggerExport = () => api.post('/export').then(r => r.data);
 export const updateSelectionFilterToggle = (key, enabled, password) =>
