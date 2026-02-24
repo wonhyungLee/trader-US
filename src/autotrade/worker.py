@@ -556,9 +556,8 @@ def _sync_daytrade_plans_and_queue(
             continue
         target_price = _to_float(od.get("target_unpr"))
         stop_price = _to_float(od.get("stop_unpr"))
-        qty = int(od.get("qty") or cfg.default_amount or 1)
-        if qty <= 0:
-            qty = max(1, int(cfg.default_amount))
+        # Auto-trade webhook payload amount is fixed to 1 share.
+        qty = 1
 
         store.upsert_autotrade_plan(
             asof_date=signal_date,
@@ -1001,6 +1000,8 @@ def run_cycle(store: SQLiteStore, settings: dict, cfg: AutoTradeConfig, *, dry_r
             if not isinstance(payload, dict):
                 _mark_result(store, order_id=int(it["id"]), status="ERROR", error_text="payload_json_not_object")
                 continue
+            if str(payload.get("amount") or "").strip() != "1":
+                payload["amount"] = "1"
             try:
                 ok, http_status, body = _send_webhook(url, payload)
                 if ok:
